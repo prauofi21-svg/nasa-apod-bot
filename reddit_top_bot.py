@@ -290,8 +290,11 @@ def translate_post(post: dict):
     prompt += (
         "\nRules:\n"
         "- title_fa: an attractive, faithful Persian translation of the title\n"
-        "- summary_fa: 1-3 short Persian sentences summarizing the post (use the "
-        "post text when present, otherwise the title); friendly scientific tone\n"
+        "- summary_fa: 1-3 short Persian sentences summarizing the post; friendly "
+        "scientific tone; use the post text when it adds real information, but "
+        "if the post text is only a question to readers, a call for comments, "
+        "or meta content (edits, thanks, links), base the summary on the title "
+        "alone and ignore that text\n"
         "- No links, no hashtags, no markdown symbols; keep proper names in Latin "
         "where that is more natural\n"
         'Respond ONLY as JSON: {"title_fa": "...", "summary_fa": "..."}'
