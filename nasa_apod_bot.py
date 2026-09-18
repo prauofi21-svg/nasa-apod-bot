@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NASA APOD -> Telegram channel automation.
+NASA APOD -> Telegram channel automation (Persian-only posts).
 
-Fetches NASA's Astronomy Picture of the Day (image or video) and posts it to
-a Telegram channel with a clean English caption (title, date, explanation,
-credit) — with no links inside the post.
+Fetches NASA's Astronomy Picture of the Day (image or video), translates the
+title and explanation into sweet, engaging Persian with an LLM (Groq / xAI —
+see llm_translator.py), and posts it to the Telegram channel as a clean
+Persian-only post: a minimal professional caption (series title, emoji,
+Persian title, Jalali date, credit, 2-4 hashtags) followed by the Persian
+explanation message. No links, no English text (proper names excepted).
 
 Designed to run for free on GitHub Actions, with de-duplication via a state
-file so an APOD is never posted twice for the same day.
+file so an APOD is never posted twice for the same day. If the Persian
+translation cannot be produced, the run FAILS on purpose so the backup cron
+run retries later (the channel policy is: Persian only, never English).
 
 Command line:
     python nasa_apod_bot.py                post today's APOD to the channel
@@ -20,6 +25,7 @@ Required environment variables (stored as GitHub Secrets):
     TELEGRAM_BOT_TOKEN   bot token from @BotFather
     TELEGRAM_CHAT_ID     channel chat id (looks like -1001234567890)
     NASA_API_KEY         personal key from https://api.nasa.gov/
+    GROK_API_KEY         LLM API key (Groq or xAI) for the Persian translation
 
 Optional environment variables:
     CHANNEL_SIGNATURE       footer text, e.g. "@YourChannel" (default: empty)
@@ -53,7 +59,8 @@ except ImportError:
     YTDLP_AVAILABLE = False
 
 try:
-    from llm_translator import translate_fields
+    from llm_translator import ask_llm, parse_json_obj
+    from persian_utils import parse_hashtags, pick_emoji, pretty_date_fa, has_persian
     TRANSLATION_AVAILABLE = True
 except ImportError:
     TRANSLATION_AVAILABLE = False
@@ -141,51 +148,97 @@ def build_full_post(apod: dict, video_preview: bool = False) -> str:
     return "\n\n".join(parts)
 
 
-def build_bilingual_header(apod: dict, translation: dict, video_preview: bool = False) -> str:
-    """Bilingual (Persian + English) caption for the media post."""
-    lines = [
-        "🌌 عکس نجومی روز ناسا | Astronomy Picture of the Day",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"✨ {translation['title_fa']}",
-        f"✨ {(apod.get('title') or 'Untitled').strip()}",
-        f"📅 {pretty_date(apod.get('date', ''))}",
-    ]
+def build_persian_header(apod: dict, translation: dict, video_preview: bool = False) -> str:
+    """
+    Persian-only media caption: series title, emoji + Persian title,
+    Jalali date, credit, and a minimal set of hashtags.
+    """
+    lines = ["🌌 عکس نجومی روز ناسا", ""]
+    lines.append(f"{translation['emoji']} {translation['title_fa'].strip()}")
+    lines.append("")
+    date_fa = pretty_date_fa(apod.get("date", ""))
+    if date_fa:
+        lines.append(f"📅 {date_fa}")
     credit = " ".join((apod.get("copyright") or "").split())
     if credit:
-        lines.append(f"🔭 Credit: {credit}")
+        lines.append(f"🔭 اعتبار: {credit}")
     if video_preview:
-        lines.append("🎞 امروز APOD یک ویدئو است — تصویر پیش‌نمایش | video day")
+        lines.append("🎞 موضوع امروز یک ویدئو است؛ تصویر بالا پیش‌نمایشی از آن است.")
+    tags = translation.get("hashtags") or []
+    if tags:
+        lines.append("")
+        lines.append(" ".join(tags))
     header = "\n".join(lines)
     if len(header) > MAX_CAPTION_LEN:
         header = header[: MAX_CAPTION_LEN - 1] + "…"
     return header
 
 
+APOD_TRANSLATION_SYSTEM = (
+    "You are the editor of a popular Persian-language science Telegram "
+    "channel. You always answer with valid JSON only — no commentary, no "
+    "markdown fences."
+)
+
+DEFAULT_APOD_EMOJI = "🌌"
+DEFAULT_APOD_TAGS = ["#نجوم", "#ناسا"]
+
+
 def translate_apod(apod: dict):
     """
-    Translate the APOD title + explanation into engaging Persian via the LLM.
-    Returns {'title_fa': ..., 'explanation_fa': ...} or None on any failure
-    (callers fall back to the English-only post).
+    Translate the APOD into sweet Persian and pick an emoji + hashtags.
+
+    Returns {'title_fa', 'explanation_fa', 'emoji', 'hashtags'} or None on
+    any failure. Real runs treat None as fatal (Persian-only policy) and let
+    the backup cron run retry.
     """
     if not TRANSLATION_AVAILABLE:
         return None
     title = (apod.get("title") or "").strip()
     explanation = normalize_explanation(apod.get("explanation"))
     prompt = (
-        "Translate this NASA Astronomy Picture of the Day into engaging, natural "
-        "Persian (Farsi) for a Telegram science channel.\n\n"
-        f"Title: {title}\n\n"
-        f"Explanation:\n{explanation}\n\n"
+        "Write today's channel post for this NASA Astronomy Picture of the "
+        "Day, in sweet, fluent, engaging Persian (فارسی شیرین) that Iranian "
+        "readers love — warm, precise, and easy to read on a phone.\n\n"
+        f"English title: {title}\n\n"
+        f"English explanation:\n{explanation}\n\n"
         "Rules:\n"
         "- title_fa: an attractive, faithful Persian translation of the title\n"
-        "- explanation_fa: an engaging Persian translation of the explanation; "
-        "accurate, 2-4 short paragraphs, friendly scientific tone, easy to read "
-        "on a phone\n"
-        "- No links, no hashtags, no markdown symbols; keep proper names in Latin "
-        "where that is more natural; use Persian numerals where natural\n"
-        'Respond ONLY as JSON: {"title_fa": "...", "explanation_fa": "..."}'
+        "- explanation_fa: an engaging, accurate Persian rendering of the "
+        "explanation in 2-5 short paragraphs; keep the substance complete; "
+        "friendly scientific tone; no links, no markdown, no emojis inside "
+        "the text\n"
+        "- emoji: exactly ONE emoji that fits this picture's subject (space or "
+        "astronomy themed, e.g. 🪐 🌌 🌠 🌞 ☄️) — nothing but the emoji\n"
+        "- hashtags: 2-4 Persian hashtags, space separated, each starting with "
+        "#; single tokens only (use _ inside a tag; no spaces, no ZWNJ); "
+        "highly relevant to THIS picture\n"
+        "- Persian script only; use the common Persian form of well-known "
+        "proper names (ناسا، تلسکوپ فضایی جیمز وب) and keep other proper "
+        "names in Latin; write numbers with Persian numerals (۰۱۲۳۴۵۶۷۸۹)\n\n"
+        'Respond ONLY as JSON: {"title_fa": "...", "explanation_fa": "...", '
+        '"emoji": "...", "hashtags": "#... #..."}'
     )
-    return translate_fields(prompt, ("title_fa", "explanation_fa"))
+    for attempt in (1, 2):
+        raw = ask_llm(APOD_TRANSLATION_SYSTEM, prompt, max_tokens=2048,
+                      temperature=0.4)
+        data = parse_json_obj(raw)
+        if data:
+            title_fa = str(data.get("title_fa") or "").strip().strip('"“”')
+            explanation_fa = str(data.get("explanation_fa") or "").strip()
+            if (title_fa and explanation_fa and has_persian(title_fa)
+                    and has_persian(explanation_fa) and len(explanation_fa) >= 80):
+                return {
+                    "title_fa": title_fa,
+                    "explanation_fa": explanation_fa,
+                    "emoji": pick_emoji(str(data.get("emoji") or ""),
+                                        default=DEFAULT_APOD_EMOJI),
+                    "hashtags": parse_hashtags(
+                        str(data.get("hashtags") or ""),
+                        default=DEFAULT_APOD_TAGS, max_tags=4),
+                }
+        log.warning("Persian translation attempt %d failed validation", attempt)
+    return None
 
 
 def split_text(text: str, limit: int = MAX_MESSAGE_LEN) -> list:
@@ -606,30 +659,28 @@ def save_state(apod: dict) -> None:
 
 def publish(apod: dict, media_path, video_preview: bool, translation: dict = None) -> None:
     """
-    Post the APOD to the channel.
+    Post the APOD to the channel in Persian only.
 
-    With a Persian translation available (recommended):
-      - media post with a bilingual caption (fa+en title, date, credit)
-      - follow-up message with the full Persian translation
-      - follow-up message with the English original
-    Without a translation: the classic English-only layout.
+      - media post with the Persian caption (series title, emoji + Persian
+        title, Jalali date, credit, hashtags)
+      - follow-up message with the full Persian explanation
+
+    The English-only layout is kept purely as a defensive fallback for
+    dry-run previews when no LLM is reachable.
     """
     if translation:
-        header = build_bilingual_header(apod, translation, video_preview)
+        header = build_persian_header(apod, translation, video_preview)
         if media_path is not None:
             send_media(media_path, header)
         else:
             log.warning("No media available — sending the post as text only")
             send_message(header)
         time.sleep(1)
-        fa_text = "🇮🇷 ترجمه فارسی:\n\n" + translation["explanation_fa"]
+        fa_text = translation["explanation_fa"]
         if CHANNEL_SIGNATURE:
-            fa_text += f"\n\n— {CHANNEL_SIGNATURE}"
-        send_message(fa_text)
-        time.sleep(1)
-        en_explanation = normalize_explanation(apod.get("explanation"))
-        if en_explanation:
-            send_message("🌍 English original:\n\n" + en_explanation)
+            fa_text = f"{fa_text}\n\n— {CHANNEL_SIGNATURE}"
+        if fa_text:
+            send_message(fa_text)
         return
 
     full_post = build_full_post(apod, video_preview)
@@ -703,20 +754,27 @@ def main() -> int:
     media_path, video_preview = prepare_media(apod)
     translation = translate_apod(apod) if TRANSLATION_AVAILABLE else None
     if translation:
-        log.info("Persian translation ready (%d chars)", len(translation["explanation_fa"]))
+        log.info("Persian translation ready (%d chars, emoji %s, %d hashtags)",
+                 len(translation["explanation_fa"]), translation["emoji"],
+                 len(translation["hashtags"]))
+    elif not args.dry_run:
+        # Channel policy is Persian-only — fail the run so the backup cron
+        # run retries with a fresh LLM connection instead of posting English.
+        raise RuntimeError(
+            "Persian translation unavailable — aborting (Persian-only policy) "
+            "so the backup run can retry"
+        )
     else:
-        log.info("No Persian translation — posting English-only")
+        log.warning("No Persian translation — showing the English fallback "
+                    "(dry run only)")
 
     if args.dry_run:
         print("\n" + "=" * 62)
         print("POST PREVIEW (dry run — nothing was sent)")
         print("=" * 62)
         if translation:
-            print(build_bilingual_header(apod, translation, video_preview))
-            print("\n🇮🇷 ترجمه فارسی:\n\n" + translation["explanation_fa"])
-            en_explanation = normalize_explanation(apod.get("explanation"))
-            if en_explanation:
-                print("\n🌍 English original:\n\n" + en_explanation)
+            print(build_persian_header(apod, translation, video_preview))
+            print("\n" + translation["explanation_fa"])
         else:
             print(build_full_post(apod, video_preview))
         print("=" * 62)
