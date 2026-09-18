@@ -125,12 +125,30 @@ def build_header(apod: dict, video_preview: bool = False) -> str:
     return header
 
 
+APOD_META_RE = re.compile(
+    r"(?i)(apod\.nasa\.gov|science\.nasa\.gov|\bnew\s+apod\s+site\b)"
+)
+
+
+def strip_apod_meta(text: str) -> str:
+    """
+    Remove APOD website meta notes (e.g. "the main APOD site has moved to
+    science.nasa.gov/apod") — irrelevant noise for the channel post.
+    """
+    text = text or ""
+    if not APOD_META_RE.search(text):
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    kept = [s for s in sentences if not APOD_META_RE.search(s)]
+    return " ".join(kept).strip()
+
+
 def normalize_explanation(text: str) -> str:
     """
-    Tidy NASA's explanation text: NASA separates paragraphs with runs of
-    spaces — turn those into real paragraph breaks for nicer rendering.
+    Tidy NASA's explanation text: drop website meta notes, then turn NASA's
+    space-run paragraph separators into real paragraph breaks.
     """
-    text = (text or "").strip()
+    text = strip_apod_meta((text or "").strip())
     text = re.sub(r"[ \t]{3,}", "\n\n", text)   # 3+ spaces -> paragraph break
     text = re.sub(r"[ \t]{2,}", " ", text)      # leftover double spaces
     text = re.sub(r"\n{3,}", "\n\n", text)      # too many blank lines
@@ -222,10 +240,21 @@ def translate_apod(apod: dict):
         "5. Every single word must make sense to an average Iranian reader; "
         "if unsure about a word, use the everyday Persian word.\n"
         "6. Persian script only; well-known proper names in their common "
-        "Persian form (ناسا، تلسکوپ فضایی جیمز وب، تلسکوپ هابل), other "
-        "proper names in Latin; numbers with Persian numerals "
-        "(۰۱۲۳۴۵۶۷۸۹).\n"
-        "7. No links, no markdown, no emojis inside title_fa/explanation_fa.\n\n"
+        "Persian form, other proper names in Latin; numbers with Persian "
+        "numerals (۰۱۲۳۴۵۶۷۸۹).\n"
+        "7. No links, no markdown, no emojis inside title_fa/explanation_fa.\n"
+        "8. Ignore and drop any meta note about websites, links, or APOD "
+        "site changes — never translate such notes.\n\n"
+        "MANDATORY GLOSSARY — use exactly these established equivalents:\n"
+        "Andromeda = آندرومدا (NEVER آندروید) | Pinwheel Galaxy = کهکشان "
+        "فرفره | Triangulum Galaxy = کهکشان مثلث | Milky Way = راه شیری | "
+        "Local Group = گروه محلی | satellite galaxy = کهکشان ماهواره‌ای | "
+        "face-on (orientation) = روبه‌روی ناظر | star-forming region = منطقهٔ "
+        "شکل‌گیری ستاره | star cluster = خوشهٔ ستاره‌ای | nebula = سحابی | "
+        "light-year = سال نوری | nebula NGC/IC names stay as NGC/IC | "
+        "James Webb Space Telescope = تلسکوپ فضایی جیمز وب | Hubble = هابل | "
+        "variable star = ستارهٔ متغیر | distance ladder/standard candle = "
+        "شمع استاندارد کیهانی\n\n"
         "OUTPUT FIELDS:\n"
         "- title_fa: an attractive, faithful Persian translation of the "
         "title\n"
