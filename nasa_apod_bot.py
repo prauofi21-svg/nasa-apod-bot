@@ -40,7 +40,7 @@ import re
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -74,7 +74,7 @@ MAX_FILE_SIZE = 48 * 1024 * 1024     # stay under Telegram's 50 MB upload limit
 
 HTTP_TIMEOUT = (30, 60)              # (connect, read) seconds
 UPLOAD_TIMEOUT = (30, 300)           # file uploads get a longer window
-NASA_RETRIES = 12                    # NASA API has transient 500s — be patient
+NASA_RETRIES = 12                    # legacy cap — fetch_apod uses its own cycle logic
 TG_RETRIES = 5
 
 log = logging.getLogger("apod-bot")
@@ -157,34 +157,57 @@ def split_text(text: str, limit: int = MAX_MESSAGE_LEN) -> list:
 # --------------------------------------------------------------------------- #
 
 def fetch_apod() -> dict:
-    """Fetch today's APOD with retries. Returns the parsed JSON dict."""
+    """
+    Fetch the latest available APOD.
+
+    NASA's API returns HTTP 500 for the "today" query when the current day's
+    entry has not been published yet (typically in the hours before the new
+    APOD goes live) or during short outages. We therefore:
+      1. try "today" (no date param), and
+      2. if it keeps failing, walk back up to 3 previous days and use the
+         most recent entry NASA can serve,
+    repeating the whole cycle a few times so transient outages also heal.
+    The returned entry's own `date` field drives duplicate protection, so a
+    fallback entry that was already posted is never posted twice.
+    """
     api_key = NASA_API_KEY or "DEMO_KEY"
-    params = {"api_key": api_key, "thumbs": "true"}
+    today = datetime.now(timezone.utc).date()
+    candidates = [None] + [(today - timedelta(days=n)).isoformat() for n in range(1, 4)]
     last_error = None
-    for attempt in range(1, NASA_RETRIES + 1):
-        try:
-            resp = requests.get(APOD_API_URL, params=params, timeout=HTTP_TIMEOUT)
-            try:
-                payload = resp.json()
-            except ValueError:
-                payload = None
-            if resp.status_code == 200 and isinstance(payload, dict) and payload.get("url"):
-                return payload
-            if resp.status_code == 429:
-                log.warning("NASA API rate limit — waiting 30 s")
-                time.sleep(30)
-                continue
-            desc = (payload or {}).get("error") or (payload or {}).get("msg") or f"HTTP {resp.status_code}"
-            last_error = RuntimeError(f"NASA API error: {desc}")
-        except requests.RequestException as exc:
-            last_error = exc
-        if attempt < NASA_RETRIES:
-            delay = min(20 * attempt, 90)
+    for cycle in range(1, 4):
+        for cand in candidates:
+            for _ in range(2):  # two quick tries per candidate
+                params = {"api_key": api_key, "thumbs": "true"}
+                if cand:
+                    params["date"] = cand
+                try:
+                    resp = requests.get(APOD_API_URL, params=params, timeout=HTTP_TIMEOUT)
+                    try:
+                        payload = resp.json()
+                    except ValueError:
+                        payload = None
+                    if resp.status_code == 200 and isinstance(payload, dict) and payload.get("url"):
+                        if cand:
+                            log.warning(
+                                "Latest APOD unavailable — using the %s entry instead", cand
+                            )
+                        return payload
+                    if resp.status_code == 429:
+                        log.warning("NASA API rate limit — waiting 30 s")
+                        time.sleep(30)
+                        continue
+                    desc = (payload or {}).get("error") or (payload or {}).get("msg") or f"HTTP {resp.status_code}"
+                    last_error = RuntimeError(f"NASA API error: {desc}")
+                except requests.RequestException as exc:
+                    last_error = exc
+                time.sleep(5)
+        if cycle < 3:
+            pause = 60 * cycle
             log.warning(
-                "NASA APOD fetch attempt %d/%d failed (%s) — retrying in %d s",
-                attempt, NASA_RETRIES, last_error, delay,
+                "APOD fetch cycle %d/3 failed (%s) — retrying in %d s",
+                cycle, last_error, pause,
             )
-            time.sleep(delay)
+            time.sleep(pause)
     raise RuntimeError(f"Could not fetch APOD from NASA API: {last_error}")
 
 
