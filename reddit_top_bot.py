@@ -31,8 +31,10 @@ Optional environment variables:
     SUBREDDITS          default "science+space+astronomy" (+ separated)
     POSTS_COUNT         default 5
     MIN_SCORE           default 50
-    MIRROR_HOURS        default 30 — mirror look-back window (slightly more
-                        than a day so crawl lag does not hide top posts)
+    MIRROR_HOURS        default 54 — mirror look-back window. The mirror
+                        refreshes post scores roughly 30h after creation, so
+                        a wider window is required to see real (updated)
+                        scores; the de-duplication state makes it safe.
     STATE_FILE          default state_reddit.json
     FORCE_POST          "true" — same as --force
     REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET — official OAuth API (optional)
@@ -74,7 +76,7 @@ from nasa_apod_bot import (
 SUBREDDITS = [s.strip() for s in os.environ.get("SUBREDDITS", "science+space+astronomy").replace(",", "+").split("+") if s.strip()]
 POSTS_COUNT = int(os.environ.get("POSTS_COUNT", "5"))
 MIN_SCORE = int(os.environ.get("MIN_SCORE", "50"))
-MIRROR_HOURS = int(os.environ.get("MIRROR_HOURS", "30"))
+MIRROR_HOURS = int(os.environ.get("MIRROR_HOURS", "54"))
 STATE_FILE = os.environ.get("STATE_FILE", "state_reddit.json").strip()
 CHANNEL_SIGNATURE = os.environ.get("CHANNEL_SIGNATURE", "").strip()
 
@@ -169,10 +171,14 @@ def fetch_via_arctic_shift() -> list:
     """
     Fallback: the Arctic-Shift archive mirror (no auth needed).
 
-    Scores are re-crawled periodically, so posts older than a few hours carry
-    close-to-live scores; very fresh posts may lag. The MIRROR_HOURS look-back
-    window (default 30h) compensates for the crawl lag, and the de-duplication
-    state makes the wider window safe.
+    Scores are re-crawled roughly 30h after post creation, so recent posts
+    carry stale (near-zero) scores while posts from ~1-2 days ago have real,
+    updated scores. The MIRROR_HOURS look-back window (default 54h) therefore
+    spans far enough back to rank yesterday's true top posts, and the
+    de-duplication state guarantees no post is ever published twice.
+    Net effect: the channel carries each day's genuine top posts with about
+    a one-day delay. Setting REDDIT_CLIENT_ID/SECRET (official OAuth API)
+    removes that delay entirely.
     """
     after = f"{MIRROR_HOURS}h"
     posts = []
