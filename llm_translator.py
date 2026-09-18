@@ -128,6 +128,16 @@ def set_model_override(model: str):
     _DETECTED = None  # re-detect with the override in place
 
 
+# Optional different model for the editor pass (None = same as translator).
+_EDITOR_MODEL = (os.environ.get("LLM_EDITOR_MODEL") or "").strip() or None
+
+
+def set_editor_model(model: str):
+    """Force the model used by review_translation() (QA / experiments)."""
+    global _EDITOR_MODEL
+    _EDITOR_MODEL = (model or "").strip() or None
+
+
 def available_models() -> list:
     """Model ids offered by the working provider (empty list if none)."""
     for prov in PROVIDERS:
@@ -147,14 +157,19 @@ def current_model() -> str:
     return det["model"] if det else ""
 
 
-def ask_llm(system: str, user: str, max_tokens: int = 2048, temperature: float = 0.3, retries: int = 3):
-    """Send one chat completion. Returns the reply text, or None on failure."""
+def ask_llm(system: str, user: str, max_tokens: int = 2048, temperature: float = 0.3,
+             retries: int = 3, model: str = None):
+    """Send one chat completion. Returns the reply text, or None on failure.
+
+    `model` optionally overrides the detected model for this single call
+    (used to run the editor pass on a different model).
+    """
     det = _detect()
     if det is None:
         return None
     url = f"{det['base']}/chat/completions"
     payload = {
-        "model": det["model"],
+        "model": (model or det["model"]).strip() or det["model"],
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -185,18 +200,63 @@ def ask_llm(system: str, user: str, max_tokens: int = 2048, temperature: float =
 
 
 def parse_json_obj(text):
-    """Extract the first JSON object from an LLM reply (tolerates fences)."""
+    """Extract the first JSON object from an LLM reply (tolerates fences).
+
+    LLMs frequently emit literal newlines / tabs inside JSON string values
+    (e.g. a multi-paragraph explanation_fa echoed back by the editor pass),
+    which makes strict json.loads fail. We therefore try, in order:
+      1. strict parse of the { ... } slice,
+      2. the same slice after repairing control characters / trailing commas.
+    """
     if not text:
         return None
     cleaned = re.sub(r"```(?:json)?", "", text).strip().strip("`").strip()
     start, end = cleaned.find("{"), cleaned.rfind("}")
     if start == -1 or end <= start:
         return None
-    try:
-        data = json.loads(cleaned[start:end + 1])
-        return data if isinstance(data, dict) else None
-    except ValueError:
-        return None
+    candidate = cleaned[start:end + 1]
+    for attempt in (candidate, _repair_json(candidate)):
+        try:
+            data = json.loads(attempt)
+            if isinstance(data, dict):
+                return data
+        except ValueError:
+            continue
+    return None
+
+
+def _repair_json(text: str) -> str:
+    """Best-effort repair of LLM JSON: escape control chars inside strings
+    and drop trailing commas before } or ]."""
+    out = []
+    in_str = False
+    esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                out.append(ch)
+                esc = False
+            elif ch == "\\":
+                out.append(ch)
+                esc = True
+            elif ch == '"':
+                out.append(ch)
+                in_str = False
+            elif ch == "\n":
+                out.append("\\n")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\t":
+                out.append("\\t")
+            else:
+                out.append(ch)
+        else:
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+    repaired = "".join(out)
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    return repaired
 
 
 # --------------------------------------------------------------------------- #
@@ -248,7 +308,8 @@ def review_translation(english_source: str, draft: dict,
 
     `english_source` is the ground-truth English text; `draft` is the parsed
     JSON from pass 1. Returns the corrected dict (same keys), or None when
-    the editor call fails (callers then keep the draft as-is).
+    the editor call fails (callers then keep the draft as-is). Two attempts
+    are made — a failed first reply is often a transient formatting glitch.
     """
     det = _detect()
     if det is None or not draft:
@@ -283,8 +344,18 @@ def review_translation(english_source: str, draft: dict,
         f"Draft Persian translation (JSON):\n{draft_json}\n\n"
         "Return ONLY the corrected JSON with the same keys."
     )
-    raw = ask_llm(EDITOR_SYSTEM, prompt, max_tokens=max_tokens, temperature=0.2)
+    raw = ask_llm(EDITOR_SYSTEM, prompt, max_tokens=max_tokens, temperature=0.2,
+                  model=_EDITOR_MODEL)
     data = parse_json_obj(raw)
+    if not data and raw:
+        log.warning("Editor reply was not valid JSON (head: %r)", raw[:160])
+        # one more attempt — often the model just misformatted once
+        time.sleep(2)
+        raw = ask_llm(EDITOR_SYSTEM, prompt, max_tokens=max_tokens,
+                      temperature=0.1, model=_EDITOR_MODEL)
+        data = parse_json_obj(raw)
+        if not data and raw:
+            log.warning("Editor retry also failed (head: %r)", raw[:160])
     if not data:
         log.warning("Editor pass returned invalid JSON — keeping the draft")
         return None
