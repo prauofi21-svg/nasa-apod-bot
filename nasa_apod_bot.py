@@ -74,7 +74,7 @@ MAX_FILE_SIZE = 48 * 1024 * 1024     # stay under Telegram's 50 MB upload limit
 
 HTTP_TIMEOUT = (30, 60)              # (connect, read) seconds
 UPLOAD_TIMEOUT = (30, 300)           # file uploads get a longer window
-NASA_RETRIES = 6                     # NASA API has transient 500s — be patient
+NASA_RETRIES = 12                    # NASA API has transient 500s — be patient
 TG_RETRIES = 5
 
 log = logging.getLogger("apod-bot")
@@ -179,7 +179,7 @@ def fetch_apod() -> dict:
         except requests.RequestException as exc:
             last_error = exc
         if attempt < NASA_RETRIES:
-            delay = min(15 * attempt, 60)
+            delay = min(20 * attempt, 90)
             log.warning(
                 "NASA APOD fetch attempt %d/%d failed (%s) — retrying in %d s",
                 attempt, NASA_RETRIES, last_error, delay,
