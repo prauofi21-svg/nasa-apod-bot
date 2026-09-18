@@ -337,12 +337,14 @@ def translate_post(post: dict):
         "MANDATORY GLOSSARY — use exactly these established equivalents:\n"
         "manual dexterity = چابکی دست (NEVER دست‌کاری) | balance = تعادل | "
         "space colony = مستعمرهٔ فضایی / lunar colony = مستعمرهٔ ماه (NEVER "
-        "کلانی، NEVER استعمار for settlements) | Mars = مریخ | the Moon = ماه | "
-        "water shortage = کمبود آب | study = مطالعه/پژوهش | researchers = "
-        "پژوهشگران | AI = هوش مصنوعی | vaccine = واکسن | gene = ژن | brain = "
-        "مغز | exoplanet = سیارهٔ فراخورشیدی | telescope = تلسکوپ | "
-        "satellite = ماهواره | rocket = موشک/پرتابه | spacecraft = فضاپیما | "
-        "dark matter = مادهٔ تاریک | black hole = سیاه‌چاله\n\n"
+        "کلانی، NEVER استعمار for settlements) | Messier NN = مسیه NN | "
+        "constellation = صورت‌فلکی | Milky Way = راه شیری | Mars = مریخ | "
+        "the Moon = ماه | water shortage = کمبود آب | study = مطالعه/پژوهش | "
+        "researchers = پژوهشگران | AI = هوش مصنوعی | vaccine = واکسن | "
+        "gene = ژن | brain = مغز | exoplanet = سیارهٔ فراخورشیدی | "
+        "telescope = تلسکوپ | satellite = ماهواره | rocket = موشک/پرتابه | "
+        "spacecraft = فضاپیما | dark matter = مادهٔ تاریک | black hole = "
+        "سیاه‌چاله\n\n"
         "OUTPUT FIELDS:\n"
         "- title_fa: an attractive, faithful Persian translation of the "
         "title\n"
@@ -619,7 +621,7 @@ def main() -> int:
                 send_message(chunk)
         mark_posted(post["id"], today)
         posted_count += 1
-        time.sleep(2)  # gentle pacing between posts
+        time.sleep(8)  # pacing: qwen's output-token limit needs breathing room
 
     if args.dry_run:
         print("\n(dry run — nothing was sent, state untouched)")
