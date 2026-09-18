@@ -3,14 +3,20 @@
 """
 Reddit Top Daily -> Telegram channel automation.
 
-Fetches the day's top posts from science subreddits (via Reddit's public JSON
-API), translates them into engaging Persian with an LLM (Grok/Groq — see
-llm_translator.py), and posts the best POSTS_COUNT of them to the Telegram
-channel, with the preview image when available.
+Fetches the day's top posts from science subreddits, translates them into
+engaging Persian with an LLM (see llm_translator.py), and posts the best
+POSTS_COUNT of them to the Telegram channel, with the preview image when
+available.
 
-De-duplication: state_reddit.json remembers recently posted Reddit post ids,
-so a post is never published twice (the backup workflow run is a no-op when
-the main run already succeeded).
+Reddit data sources are tried in order (datacenter IPs are often blocked by
+Reddit's public JSON API, so a mirror is the reliable fallback):
+  1. the public JSON endpoints (www/old/api.reddit.com) — live scores
+  2. the official OAuth API, if REDDIT_CLIENT_ID/SECRET are set — live scores
+  3. the Arctic-Shift archive mirror (no auth) — scores updated periodically
+
+De-duplication: STATE_FILE remembers recently posted Reddit post ids, so a
+post is never published twice (the backup workflow run is a no-op when the
+main run already succeeded).
 
 Command line:
     python reddit_top_bot.py                post today's top posts
@@ -22,18 +28,14 @@ Required environment variables (GitHub Secrets):
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GROK_API_KEY
 
 Optional environment variables:
-    SUBREDDITS         default "science+space+astronomy"
-    POSTS_COUNT        default 5
-    MIN_SCORE          default 50 (posts below this score are skipped)
-    REDDIT_TIME_RANGE  default "day" (hour|day|week|month|year)
-    STATE_FILE         default state_reddit.json
-    FORCE_POST         "true" — same as --force
-
-Note on Reddit blocking: datacenter IPs (including GitHub Actions runners)
-are sometimes blocked from the public JSON endpoints. The script tries three
-hosts in turn and, if REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET are set, also
-the official OAuth API. If everything fails the run fails loudly so the
-backup run can retry.
+    SUBREDDITS          default "science+space+astronomy" (+ separated)
+    POSTS_COUNT         default 5
+    MIN_SCORE           default 50
+    MIRROR_HOURS        default 30 — mirror look-back window (slightly more
+                        than a day so crawl lag does not hide top posts)
+    STATE_FILE          default state_reddit.json
+    FORCE_POST          "true" — same as --force
+    REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET — official OAuth API (optional)
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import sys
 import tempfile
 import time
@@ -68,10 +71,10 @@ from nasa_apod_bot import (
 #  Configuration                                                               #
 # --------------------------------------------------------------------------- #
 
-SUBREDDITS = os.environ.get("SUBREDDITS", "science+space+astronomy").strip()
+SUBREDDITS = [s.strip() for s in os.environ.get("SUBREDDITS", "science+space+astronomy").replace(",", "+").split("+") if s.strip()]
 POSTS_COUNT = int(os.environ.get("POSTS_COUNT", "5"))
 MIN_SCORE = int(os.environ.get("MIN_SCORE", "50"))
-TIME_RANGE = os.environ.get("REDDIT_TIME_RANGE", "day").strip()
+MIRROR_HOURS = int(os.environ.get("MIRROR_HOURS", "30"))
 STATE_FILE = os.environ.get("STATE_FILE", "state_reddit.json").strip()
 CHANNEL_SIGNATURE = os.environ.get("CHANNEL_SIGNATURE", "").strip()
 
@@ -89,83 +92,142 @@ REDDIT_HOSTS = [
     "https://api.reddit.com",
 ]
 
+ARCTIC_SHIFT = "https://arctic-shift.photon-reddit.com/api/posts/search"
+
 MAX_IMAGE_SIZE = 48 * 1024 * 1024
+_IMAGE_EXT_RE = re.compile(r"\.(jpe?g|png|webp|gif)(?:[?#]|$)", re.I)
 
 log = logging.getLogger("reddit-bot")
 
 
 # --------------------------------------------------------------------------- #
-#  Reddit fetching                                                              #
+#  Reddit data sources                                                          #
 # --------------------------------------------------------------------------- #
 
-def _listing_url(base: str) -> str:
-    suffix = "" if base.startswith("https://api.reddit.com") else ".json"
-    return f"{base}/r/{SUBREDDITS}/top{suffix}"
+def _from_reddit_children(children: list) -> list:
+    """Normalize Reddit's {'data': {'children': [...]}} shape to flat dicts."""
+    posts = []
+    for child in children:
+        d = child.get("data", {}) if isinstance(child, dict) else {}
+        if d:
+            posts.append(d)
+    return posts
 
 
-def fetch_reddit_listing() -> list:
-    """Fetch the top listing; try public JSON hosts, then OAuth if configured."""
+def fetch_via_public_json() -> list:
+    """Try the public .json endpoints (live data, but often blocked for IPs)."""
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    params = {"t": TIME_RANGE, "limit": "25"}
-    last_err = None
+    params = {"t": "day", "limit": "25"}
+    multisub = "+".join(SUBREDDITS)
     for base in REDDIT_HOSTS:
+        suffix = "" if base.startswith("https://api.reddit.com") else ".json"
         try:
-            resp = requests.get(_listing_url(base), headers=headers,
-                                params=params, timeout=(20, 60))
+            resp = requests.get(f"{base}/r/{multisub}/top{suffix}",
+                                headers=headers, params=params, timeout=(20, 60))
             if resp.status_code == 200:
                 children = (resp.json().get("data") or {}).get("children")
                 if isinstance(children, list):
-                    log.info("Reddit listing fetched from %s (%d posts)",
-                             base, len(children))
-                    return children
-                last_err = "unexpected JSON structure"
-            else:
-                last_err = f"HTTP {resp.status_code}"
-                log.warning("Reddit host %s returned %s", base, last_err)
+                    log.info("Fetched via public JSON from %s (%d posts)", base, len(children))
+                    return _from_reddit_children(children)
+            log.warning("Public JSON host %s returned HTTP %s", base, resp.status_code)
         except (requests.RequestException, ValueError) as exc:
-            last_err = str(exc)
-            log.warning("Reddit host %s failed: %s", base, exc)
+            log.warning("Public JSON host %s failed: %s", base, exc)
+    return []
 
-    # Official OAuth API as the last resort (needs an app id/secret)
-    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
+
+def fetch_via_oauth() -> list:
+    """Use the official OAuth API when app credentials are configured."""
+    if not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
+        return []
+    try:
+        tok = requests.post(
+            "https://www.reddit.com/api/v1/access_token",
+            auth=(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET),
+            headers={"User-Agent": USER_AGENT},
+            data={"grant_type": "client_credentials"},
+            timeout=(20, 40),
+        )
+        tok.raise_for_status()
+        bearer = tok.json().get("access_token")
+        resp = requests.get(
+            f"https://oauth.reddit.com/r/{'+'.join(SUBREDDITS)}/top",
+            headers={"User-Agent": USER_AGENT, "Authorization": f"Bearer {bearer}"},
+            params={"t": "day", "limit": "25"},
+            timeout=(20, 60),
+        )
+        children = (resp.json().get("data") or {}).get("children")
+        if isinstance(children, list):
+            log.info("Fetched via official OAuth API (%d posts)", len(children))
+            return _from_reddit_children(children)
+        log.warning("OAuth listing returned HTTP %s", resp.status_code)
+    except (requests.RequestException, ValueError) as exc:
+        log.warning("OAuth fetch failed: %s", exc)
+    return []
+
+
+def fetch_via_arctic_shift() -> list:
+    """
+    Fallback: the Arctic-Shift archive mirror (no auth needed).
+
+    Scores are re-crawled periodically, so posts older than a few hours carry
+    close-to-live scores; very fresh posts may lag. The MIRROR_HOURS look-back
+    window (default 30h) compensates for the crawl lag, and the de-duplication
+    state makes the wider window safe.
+    """
+    after = f"{MIRROR_HOURS}h"
+    posts = []
+    for sub in SUBREDDITS:
         try:
-            auth = (REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
-            tok = requests.post(
-                "https://www.reddit.com/api/v1/access_token",
-                auth=auth,
-                headers={"User-Agent": USER_AGENT},
-                data={"grant_type": "client_credentials"},
-                timeout=(20, 40),
-            )
-            tok.raise_for_status()
-            bearer = tok.json().get("access_token")
             resp = requests.get(
-                "https://oauth.reddit.com/r/{}/top".format(SUBREDDITS),
-                headers={"User-Agent": USER_AGENT,
-                         "Authorization": f"Bearer {bearer}"},
-                params=params, timeout=(20, 60),
+                ARCTIC_SHIFT,
+                params={"subreddit": sub, "after": after, "limit": "100",
+                        "sort": "desc", "sort_type": "created_utc"},
+                timeout=(20, 90),
             )
-            children = (resp.json().get("data") or {}).get("children")
-            if isinstance(children, list):
-                log.info("Reddit listing fetched via OAuth (%d posts)", len(children))
-                return children
-            last_err = f"OAuth listing HTTP {resp.status_code}"
+            if resp.status_code != 200:
+                log.warning("Arctic-Shift returned HTTP %s for r/%s", resp.status_code, sub)
+                continue
+            data = resp.json().get("data") or []
+            posts.extend(data)
+            log.info("Arctic-Shift r/%s: %d posts", sub, len(data))
         except (requests.RequestException, ValueError) as exc:
-            last_err = f"OAuth failed: {exc}"
+            log.warning("Arctic-Shift failed for r/%s: %s", sub, exc)
+        time.sleep(1)
+    if not posts:
+        log.warning("Arctic-Shift returned no posts at all")
+    return posts
 
+
+def fetch_reddit_posts() -> list:
+    """Fetch posts from the first source that works (best quality first)."""
+    for fetcher, label in (
+        (fetch_via_public_json, "public JSON"),
+        (fetch_via_oauth, "OAuth"),
+        (fetch_via_arctic_shift, "Arctic-Shift mirror"),
+    ):
+        if fetcher is fetch_via_oauth and not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
+            continue
+        posts = fetcher()
+        if posts:
+            log.info("Reddit data source: %s", label)
+            return posts
     raise RuntimeError(
-        f"All Reddit endpoints failed (subreddits={SUBREDDITS!r}): {last_err}. "
-        "Datacenter IPs are sometimes blocked — retry later, or set "
-        "REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET for the official OAuth API."
+        "All Reddit data sources failed. Public JSON endpoints are blocked "
+        "from datacenter IPs; consider setting REDDIT_CLIENT_ID and "
+        "REDDIT_CLIENT_SECRET (free app from reddit.com/prefs/apps) for the "
+        "official OAuth API, or try again later if the mirror is down."
     )
 
 
-def pick_posts(children: list, posted_ids: set) -> list:
-    """Filter, de-duplicate and rank the raw listing; return the best posts."""
+# --------------------------------------------------------------------------- #
+#  Post selection                                                               #
+# --------------------------------------------------------------------------- #
+
+def pick_posts(posts: list, posted_ids: set) -> list:
+    """Filter, de-duplicate and rank raw post dicts; return the best posts."""
     picked, seen = [], set()
-    for child in children:
-        d = child.get("data", {}) if isinstance(child, dict) else {}
-        if not d:
+    for d in posts:
+        if not isinstance(d, dict):
             continue
         if d.get("stickied") or d.get("pinned"):
             continue
@@ -187,6 +249,10 @@ def pick_posts(children: list, posted_ids: set) -> list:
                 image_url = url
         except (KeyError, TypeError, IndexError):
             pass
+        if not image_url:
+            url = d.get("url") or ""
+            if url.startswith("https://i.redd.it/") and _IMAGE_EXT_RE.search(url):
+                image_url = url
 
         picked.append({
             "id": pid,
@@ -240,6 +306,8 @@ def humanize(n: int) -> str:
 
 
 def build_post_text(post: dict, translation: dict) -> str:
+    stats = (f"⬆️ {humanize(post['score'])} • 💬 {humanize(post['comments'])} "
+             f"• r/{post['subreddit']}")
     lines = [
         "🔥 برترهای ردیت | Reddit Daily Top",
         "━━━━━━━━━━━━━━━━━━━━",
@@ -250,18 +318,12 @@ def build_post_text(post: dict, translation: dict) -> str:
             lines.append("")
             lines.append(translation["summary_fa"])
         lines.append("")
-        lines.append(
-            f"⬆️ {humanize(post['score'])} • 💬 {humanize(post['comments'])} "
-            f"• r/{post['subreddit']}"
-        )
+        lines.append(stats)
         lines.append(f"🇬🇧 {post['title']}")
     else:
         lines.append(f"🇬🇧 {post['title']}")
         lines.append("")
-        lines.append(
-            f"⬆️ {humanize(post['score'])} • 💬 {humanize(post['comments'])} "
-            f"• r/{post['subreddit']}"
-        )
+        lines.append(stats)
     if CHANNEL_SIGNATURE:
         lines.append("")
         lines.append(f"— {CHANNEL_SIGNATURE}")
@@ -273,27 +335,27 @@ def build_caption(post: dict, translation: dict) -> str:
     full = build_post_text(post, translation)
     if len(full) <= MAX_CAPTION_LEN:
         return full
+    stats = (f"⬆️ {humanize(post['score'])} • 💬 {humanize(post['comments'])} "
+             f"• r/{post['subreddit']}")
     if translation:
         compact = "\n".join([
             "🔥 برترهای ردیت | Reddit Daily Top",
             f"🇮🇷 {translation['title_fa']}",
             "",
-            f"⬆️ {humanize(post['score'])} • 💬 {humanize(post['comments'])} "
-            f"• r/{post['subreddit']}",
+            stats,
         ])
     else:
         compact = "\n".join([
             "🔥 برترهای ردیت | Reddit Daily Top",
             f"🇬🇧 {post['title']}",
             "",
-            f"⬆️ {humanize(post['score'])} • 💬 {humanize(post['comments'])} "
-            f"• r/{post['subreddit']}",
+            stats,
         ])
     return compact[: MAX_CAPTION_LEN - 1] + "…" if len(compact) > MAX_CAPTION_LEN else compact
 
 
 def download_preview(url: str, workdir: Path):
-    """Download a Reddit preview image. Returns a path or None."""
+    """Download a Reddit/i.redd.it image. Returns a path or None."""
     try:
         resp = requests.get(url, timeout=(20, 120),
                             headers={"User-Agent": USER_AGENT})
@@ -345,12 +407,14 @@ def save_posted_id(pid: str) -> None:
 # --------------------------------------------------------------------------- #
 
 def reddit_report() -> str:
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     lines = []
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    multisub = "+".join(SUBREDDITS)
     for base in REDDIT_HOSTS:
+        suffix = "" if base.startswith("https://api.reddit.com") else ".json"
         try:
-            resp = requests.get(_listing_url(base), headers=headers,
-                                params={"t": TIME_RANGE, "limit": "5"}, timeout=(15, 40))
+            resp = requests.get(f"{base}/r/{multisub}/top{suffix}", headers=headers,
+                                params={"t": "day", "limit": "5"}, timeout=(15, 40))
             if resp.status_code == 200:
                 n = len((resp.json().get("data") or {}).get("children") or [])
                 lines.append(f"{base}: HTTP {resp.status_code}, children={n} — OK")
@@ -358,10 +422,22 @@ def reddit_report() -> str:
                 lines.append(f"{base}: HTTP {resp.status_code} — BLOCKED/ERROR")
         except Exception as exc:
             lines.append(f"{base}: {exc}")
-    if REDDIT_CLIENT_ID:
-        lines.append("OAuth credentials present: yes")
-    else:
-        lines.append("OAuth credentials present: no (optional REDDIT_CLIENT_ID/SECRET)")
+    try:
+        resp = requests.get(ARCTIC_SHIFT,
+                            params={"subreddit": SUBREDDITS[0], "after": "24h",
+                                    "limit": "5", "sort": "desc",
+                                    "sort_type": "created_utc"},
+                            timeout=(15, 60))
+        if resp.status_code == 200:
+            n = len(resp.json().get("data") or [])
+            lines.append(f"arctic-shift ({SUBREDDITS[0]}): HTTP 200, posts={n} — OK")
+        else:
+            lines.append(f"arctic-shift: HTTP {resp.status_code} — ERROR")
+    except Exception as exc:
+        lines.append(f"arctic-shift: {exc}")
+    lines.append(
+        "OAuth credentials: " + ("present" if REDDIT_CLIENT_ID else "not set (optional)")
+    )
     return "\n".join(lines)
 
 
@@ -394,21 +470,20 @@ def main() -> int:
         print(reddit_report())
         return 0
 
-    log.info("Subreddits: %s | top %d of %s | min score %d",
-             SUBREDDITS, POSTS_COUNT, TIME_RANGE, MIN_SCORE)
+    log.info("Subreddits: %s | top %d | min score %d | mirror window %dh",
+             "+".join(SUBREDDITS), POSTS_COUNT, MIN_SCORE, MIRROR_HOURS)
 
     force = args.force or os.environ.get("FORCE_POST", "").strip().lower() in ("1", "true", "yes", "on")
     posted_ids = set(load_state().get("posted_ids", [])) if not force else set()
     if posted_ids:
         log.info("Duplicate protection active: %d recently posted ids", len(posted_ids))
 
-    children = fetch_reddit_listing()
-    posts = pick_posts(children, posted_ids)[:POSTS_COUNT]
+    posts = pick_posts(fetch_reddit_posts(), posted_ids)[:POSTS_COUNT]
     if not posts:
         log.info("No new qualifying Reddit posts today — nothing to do.")
         return 0
     log.info("Selected %d posts: %s", len(posts),
-             ", ".join(f"[{p['score']}] {p['title'][:40]}…" for p in posts))
+             " | ".join(f"[{p['score']}]{p['title'][:35]}…" for p in posts))
 
     workdir = Path(tempfile.mkdtemp(prefix="reddit_"))
     for index, post in enumerate(posts, 1):
@@ -432,11 +507,10 @@ def main() -> int:
             if raw:
                 image = shrink_for_telegram(raw) or raw
 
-        text = build_post_text(post, translation)
         if image is not None:
             send_media(image, build_caption(post, translation))
         else:
-            for chunk in split_text(text):
+            for chunk in split_text(build_post_text(post, translation)):
                 send_message(chunk)
         save_posted_id(post["id"])
         time.sleep(2)  # gentle pacing between posts
