@@ -225,14 +225,15 @@ def validate_apod(apod: dict) -> None:
 #  Media downloaders                                                           #
 # --------------------------------------------------------------------------- #
 
-def download_image(apod: dict, workdir: Path):
-    """Download the APOD image (HD first, SD as fallback). Returns path/None."""
+def download_images(apod: dict, workdir: Path) -> list:
+    """Download all APOD image variants (HD first, SD as backup)."""
     candidates = []
     for key in ("hdurl", "url"):
         value = apod.get(key)
         if value and value not in candidates:
             candidates.append(value)
-    for url in candidates:
+    paths = []
+    for idx, url in enumerate(candidates):
         try:
             log.info("Downloading image: %s", url)
             resp = requests.get(url, timeout=(30, 180))
@@ -249,13 +250,72 @@ def download_image(apod: dict, workdir: Path):
                 log.warning("File too large (%.1f MB) — trying next candidate", len(data) / 1e6)
                 continue
             ext = Path(urlparse(url).path).suffix or mimetypes.guess_extension(content_type) or ".jpg"
-            path = workdir / f"apod_image{ext}"
+            path = workdir / f"apod_image_{idx}{ext}"
             path.write_bytes(data)
             log.info("Image saved (%.1f MB)", len(data) / 1e6)
-            return path
+            paths.append(path)
         except requests.RequestException as exc:
             log.warning("Image download failed (%s)", exc)
+    return paths
+
+
+def shrink_for_telegram(path: Path):
+    """
+    Re-encode a large image so it fits Telegram's 10 MB photo limit.
+    Returns the new path, or None if shrinking was not possible.
+    """
+    import io
+
+    target = 10 * 1024 * 1024 - 300 * 1024   # 9.7 MB with safety margin
+    if path.stat().st_size <= target:
+        return path
+    try:
+        from PIL import Image
+    except ImportError:
+        log.warning("Pillow not available — cannot shrink the image for photo upload")
+        return None
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            width, height = im.size
+            for scale in (1.0, 0.9, 0.8, 0.7, 0.6, 0.5):
+                new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+                frame = im if scale == 1.0 else im.resize(new_size, Image.LANCZOS)
+                for quality in (90, 85, 80, 74, 68, 62):
+                    buf = io.BytesIO()
+                    frame.save(buf, "JPEG", quality=quality, optimize=True, progressive=True)
+                    if buf.tell() <= target:
+                        out = path.with_name("apod_photo.jpg")
+                        out.write_bytes(buf.getvalue())
+                        log.info(
+                            "Image re-encoded to %.1f MB (scale %.2f, quality %d)",
+                            buf.tell() / 1e6, scale, quality,
+                        )
+                        return out
+    except Exception as exc:
+        log.warning("Image shrinking failed (%s)", exc)
     return None
+
+
+def select_image(paths: list):
+    """
+    Pick the best image for a Telegram *photo* post.
+    1. If a big variant exists, try to shrink it (keeps the most detail).
+    2. Otherwise use the largest variant that already fits the photo limit.
+    3. As a last resort return the biggest file (sent as a document).
+    """
+    photo_limit = 10 * 1024 * 1024 - 300 * 1024
+    if not paths:
+        return None
+    oversize = [p for p in paths if p.stat().st_size > photo_limit]
+    if oversize:
+        shrunk = shrink_for_telegram(max(oversize, key=lambda p: p.stat().st_size))
+        if shrunk:
+            return shrunk
+    fitting = [p for p in paths if p.stat().st_size <= photo_limit]
+    if fitting:
+        return max(fitting, key=lambda p: p.stat().st_size)
+    return max(paths, key=lambda p: p.stat().st_size)
 
 
 def download_video(url: str, workdir: Path):
@@ -337,7 +397,7 @@ def prepare_media(apod: dict):
         if thumb:
             return thumb, True
         return None, True
-    image = download_image(apod, workdir)
+    image = select_image(download_images(apod, workdir))
     if image:
         return image, False
     return None, False
