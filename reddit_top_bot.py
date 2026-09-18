@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Reddit Top Daily -> Telegram channel automation.
+Reddit Top Daily -> Telegram channel automation (Persian-only posts).
 
 Fetches the day's top posts from science subreddits, translates them into
-engaging Persian with an LLM (see llm_translator.py), and posts the best
-POSTS_COUNT of them to the Telegram channel, with the preview image when
-available.
+sweet Persian with an LLM (see llm_translator.py), and posts the best
+POSTS_COUNT of them to the Telegram channel — each as a minimal professional
+Persian post: emoji + Persian title, a short Persian summary, Persian-digit
+stats (score / comments / subreddit) and 2-3 hashtags. The preview image is
+attached when available. Posts that cannot be translated are skipped (the
+channel policy is: Persian only, never English).
+
+Daily quota: state_reddit.json remembers how many posts were already sent
+today, so the backup cron run only tops up what is missing instead of
+duplicating posts.
 
 Reddit data sources are tried in order (datacenter IPs are often blocked by
 Reddit's public JSON API, so a mirror is the reliable fallback):
@@ -15,8 +22,7 @@ Reddit's public JSON API, so a mirror is the reliable fallback):
   3. the Arctic-Shift archive mirror (no auth) — scores updated periodically
 
 De-duplication: STATE_FILE remembers recently posted Reddit post ids, so a
-post is never published twice (the backup workflow run is a no-op when the
-main run already succeeded).
+post is never published twice.
 
 Command line:
     python reddit_top_bot.py                post today's top posts
@@ -58,7 +64,8 @@ from urllib.parse import urlparse
 
 import requests
 
-from llm_translator import translate_fields, provider_report
+from llm_translator import ask_llm, parse_json_obj, provider_report
+from persian_utils import has_persian, humanize_fa, parse_hashtags, pick_emoji
 
 # reuse the battle-tested Telegram helpers from the NASA bot
 from nasa_apod_bot import (
@@ -277,62 +284,92 @@ def pick_posts(posts: list, posted_ids: set) -> list:
 #  Translation                                                                  #
 # --------------------------------------------------------------------------- #
 
+REDDIT_TRANSLATION_SYSTEM = (
+    "You are the editor of a popular Persian-language science Telegram "
+    "channel. You always answer with valid JSON only — no commentary, no "
+    "markdown fences."
+)
+
+DEFAULT_REDDIT_EMOJI = "🔬"
+DEFAULT_REDDIT_TAGS = ["#علم"]
+
+
 def translate_post(post: dict):
-    """Translate one Reddit post to Persian; None on failure (English fallback)."""
+    """
+    Translate one Reddit post into sweet Persian; pick an emoji + hashtags.
+
+    Returns {'title_fa', 'summary_fa', 'emoji', 'hashtags'} or None on any
+    failure — such posts are skipped (Persian-only policy).
+    """
     prompt = (
-        "Translate this Reddit science post into engaging, natural Persian "
-        "(Farsi) for a Telegram science channel.\n\n"
+        "Write the channel post for this Reddit science post, in sweet, "
+        "fluent, engaging Persian (فارسی شیرین) — accurate, no invented "
+        "facts.\n\n"
         f"Subreddit: r/{post['subreddit']}\n"
-        f"Title: {post['title']}\n"
+        f"English title: {post['title']}\n"
     )
     if post["selftext"]:
         prompt += f"Post text: {post['selftext'][:1200]}\n"
     prompt += (
         "\nRules:\n"
-        "- title_fa: an attractive, faithful Persian translation of the title\n"
-        "- summary_fa: 1-3 short Persian sentences summarizing the post; friendly "
-        "scientific tone; use the post text when it adds real information, but "
-        "if the post text is only a question to readers, a call for comments, "
-        "or meta content (edits, thanks, links), base the summary on the title "
-        "alone and ignore that text\n"
-        "- No links, no hashtags, no markdown symbols; keep proper names in Latin "
-        "where that is more natural\n"
-        'Respond ONLY as JSON: {"title_fa": "...", "summary_fa": "..."}'
+        "- title_fa: an attractive, faithful Persian translation of the "
+        "title\n"
+        "- summary_fa: 1-3 short Persian sentences giving the reader the key "
+        "point; use the post text only when it adds real information — if it "
+        "is only a question to readers, a call for comments, or meta content "
+        "(edits, thanks, links), base the summary on the title alone and "
+        "ignore it; friendly scientific tone; no links, no markdown, no "
+        "emojis\n"
+        "- emoji: exactly ONE emoji that fits the subject (e.g. 🧬 🚀 🌍 ⚛️ 🦠 "
+        "💡 🧠) — nothing but the emoji\n"
+        "- hashtags: 2-3 Persian hashtags, space separated, each starting with "
+        "#; single tokens only (use _ inside a tag; no spaces, no ZWNJ); "
+        "relevant to THIS post\n"
+        "- Persian script only; use the common Persian form of well-known "
+        "proper names (ناسا، ایلان ماسک، هوش مصنوعی) and keep other proper "
+        "names in Latin; write numbers with Persian numerals (۰۱۲۳۴۵۶۷۸۹)\n\n"
+        'Respond ONLY as JSON: {"title_fa": "...", "summary_fa": "...", '
+        '"emoji": "...", "hashtags": "#... #..."}'
     )
-    return translate_fields(prompt, ("title_fa", "summary_fa"))
+    for attempt in (1, 2):
+        raw = ask_llm(REDDIT_TRANSLATION_SYSTEM, prompt, max_tokens=700,
+                      temperature=0.4)
+        data = parse_json_obj(raw)
+        if data:
+            title_fa = str(data.get("title_fa") or "").strip().strip('"“”')
+            summary_fa = str(data.get("summary_fa") or "").strip()
+            if title_fa and has_persian(title_fa) and (summary_fa or True):
+                return {
+                    "title_fa": title_fa,
+                    "summary_fa": summary_fa if has_persian(summary_fa) else "",
+                    "emoji": pick_emoji(str(data.get("emoji") or ""),
+                                        default=DEFAULT_REDDIT_EMOJI),
+                    "hashtags": parse_hashtags(
+                        str(data.get("hashtags") or ""),
+                        default=DEFAULT_REDDIT_TAGS, max_tags=3),
+                }
+        log.warning("Persian translation attempt %d failed validation", attempt)
+    return None
 
 
 # --------------------------------------------------------------------------- #
 #  Media + text building                                                        #
 # --------------------------------------------------------------------------- #
 
-def humanize(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n / 1e6:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1e3:.1f}k"
-    return str(n)
-
-
 def build_post_text(post: dict, translation: dict) -> str:
-    stats = (f"⬆️ {humanize(post['score'])} • 💬 {humanize(post['comments'])} "
-             f"• r/{post['subreddit']}")
-    lines = [
-        "🔥 برترهای ردیت | Reddit Daily Top",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
-    if translation:
-        lines.append(f"🇮🇷 {translation['title_fa']}")
-        if translation.get("summary_fa"):
-            lines.append("")
-            lines.append(translation["summary_fa"])
+    """The full Persian post text (message body / long caption)."""
+    lines = [f"{translation['emoji']} {translation['title_fa']}"]
+    if translation.get("summary_fa"):
         lines.append("")
-        lines.append(stats)
-        lines.append(f"🇬🇧 {post['title']}")
-    else:
-        lines.append(f"🇬🇧 {post['title']}")
+        lines.append(translation["summary_fa"])
+    lines.append("")
+    lines.append(
+        f"⬆️ {humanize_fa(post['score'])} امتیاز • "
+        f"💬 {humanize_fa(post['comments'])} دیدگاه • r/{post['subreddit']}"
+    )
+    if translation.get("hashtags"):
         lines.append("")
-        lines.append(stats)
+        lines.append(" ".join(translation["hashtags"]))
     if CHANNEL_SIGNATURE:
         lines.append("")
         lines.append(f"— {CHANNEL_SIGNATURE}")
@@ -344,22 +381,16 @@ def build_caption(post: dict, translation: dict) -> str:
     full = build_post_text(post, translation)
     if len(full) <= MAX_CAPTION_LEN:
         return full
-    stats = (f"⬆️ {humanize(post['score'])} • 💬 {humanize(post['comments'])} "
-             f"• r/{post['subreddit']}")
-    if translation:
-        compact = "\n".join([
-            "🔥 برترهای ردیت | Reddit Daily Top",
-            f"🇮🇷 {translation['title_fa']}",
-            "",
-            stats,
-        ])
-    else:
-        compact = "\n".join([
-            "🔥 برترهای ردیت | Reddit Daily Top",
-            f"🇬🇧 {post['title']}",
-            "",
-            stats,
-        ])
+    compact_lines = [
+        f"{translation['emoji']} {translation['title_fa']}",
+        "",
+        (f"⬆️ {humanize_fa(post['score'])} امتیاز • "
+         f"💬 {humanize_fa(post['comments'])} دیدگاه • r/{post['subreddit']}"),
+    ]
+    if translation.get("hashtags"):
+        compact_lines.append("")
+        compact_lines.append(" ".join(translation["hashtags"]))
+    compact = "\n".join(compact_lines)
     return compact[: MAX_CAPTION_LEN - 1] + "…" if len(compact) > MAX_CAPTION_LEN else compact
 
 
@@ -396,17 +427,25 @@ def load_state() -> dict:
         return {}
 
 
-def save_posted_id(pid: str) -> None:
+def mark_posted(pid: str, day: str) -> None:
+    """
+    Record one published post: append the id (never repost it) and bump the
+    daily counter (the backup run tops up whatever is missing of POSTS_COUNT).
+    """
     state = load_state()
     posted = [p for p in state.get("posted_ids", []) if isinstance(p, str)]
-    posted.append(pid)
+    if pid not in posted:
+        posted.append(pid)
     posted = posted[-150:]  # remember the last 150 posts
+    count = state.get("posts_today") or 0 if state.get("day") == day else 0
+    state.update({
+        "posted_ids": posted,
+        "day": day,
+        "posts_today": int(count) + 1,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })
     Path(STATE_FILE).write_text(
-        json.dumps(
-            {"posted_ids": posted,
-             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")},
-            ensure_ascii=False, indent=2,
-        ),
+        json.dumps(state, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -483,24 +522,41 @@ def main() -> int:
              "+".join(SUBREDDITS), POSTS_COUNT, MIN_SCORE, MIRROR_HOURS)
 
     force = args.force or os.environ.get("FORCE_POST", "").strip().lower() in ("1", "true", "yes", "on")
-    posted_ids = set(load_state().get("posted_ids", [])) if not force else set()
+    state = load_state()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Daily quota: only POSTS_COUNT posts per UTC day; the backup run merely
+    # tops up what a partially failed main run could not send.
+    posts_today = int(state.get("posts_today") or 0) if state.get("day") == today else 0
+    remaining = POSTS_COUNT - posts_today
+    if not force and remaining <= 0:
+        log.info("Already posted %d/%d Reddit posts today (%s) — nothing to do.",
+                 posts_today, POSTS_COUNT, today)
+        return 0
+
+    posted_ids = set(state.get("posted_ids", [])) if not force else set()
     if posted_ids:
         log.info("Duplicate protection active: %d recently posted ids", len(posted_ids))
 
-    posts = pick_posts(fetch_reddit_posts(), posted_ids)[:POSTS_COUNT]
+    posts = pick_posts(fetch_reddit_posts(), posted_ids)
+    posts = posts[:POSTS_COUNT] if force else posts[:remaining]
     if not posts:
         log.info("No new qualifying Reddit posts today — nothing to do.")
         return 0
-    log.info("Selected %d posts: %s", len(posts),
+    log.info("Selected %d posts (quota %d/%d used): %s", len(posts), posts_today,
+             POSTS_COUNT,
              " | ".join(f"[{p['score']}]{p['title'][:35]}…" for p in posts))
 
     workdir = Path(tempfile.mkdtemp(prefix="reddit_"))
+    posted_count = 0
     for index, post in enumerate(posts, 1):
         translation = translate_post(post)
-        if translation:
-            log.info("[%d/%d] translated: %s", index, len(posts), translation["title_fa"][:60])
-        else:
-            log.info("[%d/%d] translation unavailable — English fallback", index, len(posts))
+        if not translation:
+            # Persian-only policy: untranslatable posts are skipped entirely.
+            log.warning("[%d/%d] translation failed — skipping this post",
+                        index, len(posts))
+            continue
+        log.info("[%d/%d] translated: %s", index, len(posts), translation["title_fa"][:60])
 
         if args.dry_run:
             print("\n" + "=" * 62)
@@ -521,14 +577,20 @@ def main() -> int:
         else:
             for chunk in split_text(build_post_text(post, translation)):
                 send_message(chunk)
-        save_posted_id(post["id"])
+        mark_posted(post["id"], today)
+        posted_count += 1
         time.sleep(2)  # gentle pacing between posts
 
     if args.dry_run:
         print("\n(dry run — nothing was sent, state untouched)")
         return 0
 
-    log.info("Posted %d Reddit top posts successfully.", len(posts))
+    if posted_count == 0:
+        # Nothing could be translated — fail the run so the backup cron run
+        # retries (Persian-only policy: we never post untranslated content).
+        log.error("No post could be translated — failing so the backup run retries.")
+        return 1
+    log.info("Posted %d/%d Reddit top posts successfully.", posted_count, len(posts))
     return 0
 
 
