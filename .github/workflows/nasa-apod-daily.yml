@@ -1,0 +1,64 @@
+name: NASA APOD Daily Post
+
+# Posts NASA's Astronomy Picture of the Day to the Telegram channel once a day.
+#   - Main run:   17:30 UTC = 21:00 (Tehran)
+#   - Backup run: 19:30 UTC = 23:00 (Tehran) — only posts if the main run
+#     failed, because state.json prevents duplicate posts.
+
+on:
+  schedule:
+    - cron: "30 17 * * *"   # main run  (21:00 Tehran)
+    - cron: "30 19 * * *"   # backup run (23:00 Tehran, skips if already posted)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Re-post even if today's APOD was already posted"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # required to save state.json (duplicate protection)
+
+concurrency:
+  group: apod-daily-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    name: Post APOD to Telegram
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch and post APOD
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NASA_API_KEY: ${{ secrets.NASA_API_KEY }}
+          STATE_FILE: state.json
+          FORCE_POST: ${{ inputs.force || 'false' }}
+        run: python nasa_apod_bot.py
+
+      - name: Save state file (duplicate protection + keeps repo active)
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json || true
+          if git diff --cached --quiet; then
+            echo "state.json unchanged — nothing to commit."
+          else
+            git commit -m "chore: update APOD state [skip ci]"
+            git push
+          fi
