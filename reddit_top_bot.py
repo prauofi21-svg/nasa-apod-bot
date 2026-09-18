@@ -64,7 +64,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from llm_translator import ask_llm, parse_json_obj, provider_report
+from llm_translator import ask_llm, parse_json_obj, provider_report, review_translation
 from persian_utils import has_persian, humanize_fa, parse_hashtags, pick_emoji
 
 # reuse the battle-tested Telegram helpers from the NASA bot
@@ -285,9 +285,9 @@ def pick_posts(posts: list, posted_ids: set) -> list:
 # --------------------------------------------------------------------------- #
 
 REDDIT_TRANSLATION_SYSTEM = (
-    "You are the editor of a popular Persian-language science Telegram "
-    "channel. You always answer with valid JSON only — no commentary, no "
-    "markdown fences."
+    "You are a professional Persian (Farsi) science writer for a popular "
+    "Iranian Telegram science channel. You always answer with valid JSON "
+    "only — no commentary, no markdown fences."
 )
 
 DEFAULT_REDDIT_EMOJI = "🔬"
@@ -296,49 +296,78 @@ DEFAULT_REDDIT_TAGS = ["#علم"]
 
 def translate_post(post: dict):
     """
-    Translate one Reddit post into sweet Persian; pick an emoji + hashtags.
+    Translate one Reddit post into flawless, sweet Persian (two passes:
+    translator + strict Persian editor); pick an emoji + hashtags.
 
     Returns {'title_fa', 'summary_fa', 'emoji', 'hashtags'} or None on any
     failure — such posts are skipped (Persian-only policy).
     """
+    english_source = (
+        f"Reddit post from r/{post['subreddit']}\nTitle: {post['title']}\n"
+    )
     prompt = (
-        "Write the channel post for this Reddit science post, in sweet, "
-        "fluent, engaging Persian (فارسی شیرین) — accurate, no invented "
-        "facts.\n\n"
+        "Write the channel post for this Reddit science post, in beautiful, "
+        "correct, natural Persian (فارسی صحیح و روان) — exactly what a "
+        "native Iranian science journalist would write; accurate, no "
+        "invented facts.\n\n"
         f"Subreddit: r/{post['subreddit']}\n"
         f"English title: {post['title']}\n"
     )
     if post["selftext"]:
         prompt += f"Post text: {post['selftext'][:1200]}\n"
+        english_source += f"Post text: {post['selftext'][:1200]}"
     prompt += (
-        "\nRules:\n"
+        "\nQUALITY RULES — all mandatory:\n"
+        "1. Translate the MEANING, never word-by-word; no calques of English "
+        "idioms — rewrite anything that sounds like a translation.\n"
+        "2. Use the standard Persian scientific terms of Persian Wikipedia "
+        "and Iranian science media; NEVER invent Persian words — if a term "
+        "has no established equivalent, describe it briefly in Persian and "
+        "put the English term in parentheses.\n"
+        "3. Perfect Persian grammar: اضافهٔ کسره (hazfe) where needed, correct "
+        "نیم‌فاصله (می‌شود، به‌صورت)، correct prepositions, verb agreement, "
+        "plurals. Zero tolerance for meaningless or misplaced words.\n"
+        "4. Every single word must make sense to an average Iranian reader.\n"
+        "5. Persian script only; well-known proper names in their common "
+        "Persian form (ناسا، ایلان ماسک، هوش مصنوعی), other proper names in "
+        "Latin; numbers with Persian numerals (۰۱۲۳۴۵۶۷۸۹).\n"
+        "6. No links, no markdown, no emojis inside title_fa/summary_fa.\n\n"
+        "OUTPUT FIELDS:\n"
         "- title_fa: an attractive, faithful Persian translation of the "
         "title\n"
         "- summary_fa: 1-3 short Persian sentences giving the reader the key "
         "point; use the post text only when it adds real information — if it "
         "is only a question to readers, a call for comments, or meta content "
         "(edits, thanks, links), base the summary on the title alone and "
-        "ignore it; friendly scientific tone; no links, no markdown, no "
-        "emojis\n"
+        "ignore it; friendly scientific tone\n"
         "- emoji: exactly ONE emoji that fits the subject (e.g. 🧬 🚀 🌍 ⚛️ 🦠 "
         "💡 🧠) — nothing but the emoji\n"
-        "- hashtags: 2-3 Persian hashtags, space separated, each starting with "
-        "#; single tokens only (use _ inside a tag; no spaces, no ZWNJ); "
-        "relevant to THIS post\n"
-        "- Persian script only; use the common Persian form of well-known "
-        "proper names (ناسا، ایلان ماسک، هوش مصنوعی) and keep other proper "
-        "names in Latin; write numbers with Persian numerals (۰۱۲۳۴۵۶۷۸۹)\n\n"
+        "- hashtags: 2-3 Persian hashtags, space separated, each starting "
+        "with #; single tokens only (use _ inside a tag; no spaces, no "
+        "ZWNJ); relevant to THIS post\n\n"
         'Respond ONLY as JSON: {"title_fa": "...", "summary_fa": "...", '
         '"emoji": "...", "hashtags": "#... #..."}'
     )
     for attempt in (1, 2):
         raw = ask_llm(REDDIT_TRANSLATION_SYSTEM, prompt, max_tokens=700,
-                      temperature=0.4)
+                      temperature=0.35)
         data = parse_json_obj(raw)
         if data:
             title_fa = str(data.get("title_fa") or "").strip().strip('"“”')
             summary_fa = str(data.get("summary_fa") or "").strip()
-            if title_fa and has_persian(title_fa) and (summary_fa or True):
+            if title_fa and (summary_fa or not post["selftext"]):
+                # Pass 2: strict Persian editor fixes wrong/meaningless words.
+                reviewed = review_translation(
+                    english_source,
+                    {k: v for k, v in (("title_fa", title_fa),
+                                       ("summary_fa", summary_fa)) if v},
+                    max_tokens=700,
+                )
+                if reviewed:
+                    title_fa = reviewed.get("title_fa", title_fa)
+                    summary_fa = reviewed.get("summary_fa", summary_fa)
+                    log.info("Editor pass applied to the Persian translation")
+            if title_fa and has_persian(title_fa):
                 return {
                     "title_fa": title_fa,
                     "summary_fa": summary_fa if has_persian(summary_fa) else "",
