@@ -30,8 +30,8 @@ from reddit_top_bot import fetch_reddit_posts, pick_posts, translate_post
 # (translator model, editor model or None = same model)
 CONFIGS = [
     ("qwen/qwen3.8-27b", None),
-    ("qwen/qwen3.8-27b", "openai/gpt-oss-120b"),
     ("openai/gpt-oss-120b", None),
+    ("qwen/qwen3.8-27b", "openai/gpt-oss-120b"),
     ("openai/gpt-oss-20b", None),
 ]
 
