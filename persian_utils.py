@@ -123,15 +123,16 @@ def parse_hashtags(text, default, max_tags: int = 4):
     """
     Validate hashtag tokens from an LLM reply.
 
-    Keeps tokens that look like '#نجوم' / '#سیاهچاله_فردی' (single token,
-    letters/underscores only, ZWNJ replaced with '_'), de-duplicates, and
-    returns at most `max_tags`. Falls back to `default` when nothing valid
-    remains.
+    Keeps tokens that look like '#نجوم' / '#سیاهچاله_فردی' — single token,
+    letters/underscores only, ZWNJ replaced with '_', and at least one
+    PERSIAN letter (the channel is Persian-only, so '#NASA' is dropped).
+    De-duplicates and returns at most `max_tags`; falls back to `default`
+    when nothing valid remains.
     """
     tags = []
     for token in (text or "").split():
         token = token.strip(",،\"'«»").replace("\u200c", "_")
-        if _TAG_RE.match(token) and token not in tags:
+        if _TAG_RE.match(token) and _HAS_PERSIAN_RE.search(token) and token not in tags:
             tags.append(token)
     if not tags:
         return list(default)
