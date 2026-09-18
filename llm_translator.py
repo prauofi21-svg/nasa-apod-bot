@@ -10,9 +10,18 @@ Works with OpenAI-compatible chat-completions APIs. Given one API key
   2. xAI   (api.x.ai/v1)             — Grok models, keys look like gsk-xxx
 
 Public helpers:
-    ask_llm(system, user, ...)        -> str | None
-    translate_fields(prompt, keys)    -> dict | None (JSON reply parsed)
-    provider_report()                 -> str (diagnostics, performs a smoke test)
+    ask_llm(system, user, ...)          -> str | None
+    translate_draft(...)                -> dict | None (first-pass JSON reply)
+    review_translation(source, draft)   -> dict | None (second-pass editor)
+    set_model_override(model)           -> force a model id (QA / testing)
+    available_models()                  -> [str] model ids of the working provider
+    provider_report()                   -> str (diagnostics, performs a smoke test)
+
+Translation strategy: TWO passes.
+    Pass 1 (translator): English -> Persian draft as JSON.
+    Pass 2 (editor): a strict Persian language editor compares the draft
+    with the English source and fixes meaningless words, wrong terms,
+    calques, and grammar errors before the text reaches the channel.
 """
 
 from __future__ import annotations
@@ -29,17 +38,24 @@ log = logging.getLogger("llm-translator")
 
 API_KEY = (os.environ.get("GROK_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
 
+# Models are tried in order; the first one offered by the provider wins.
+# Order rationale (revised after live QA on the channel translations):
+#   1. moonshotai/kimi-k2-instruct   — most natural, correct Persian prose
+#   2. openai/gpt-oss-120b           — solid, occasionally awkward wording
+#   3. meta-llama/llama-4-*          — good multilingual fallbacks
 PROVIDERS = [
     {
         "name": "Groq",
         "base": "https://api.groq.com/openai/v1",
         "models": [
-            "llama-3.3-70b-versatile",
+            "moonshotai/kimi-k2-instruct",
             "openai/gpt-oss-120b",
+            "meta-llama/llama-4-maverick-17b-128e-instruct",
+            "qwen/qwen3-32b",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
             "openai/gpt-oss-20b",
+            "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant",
-            "llama3-70b-8192",
-            "llama3-8b-8192",
         ],
     },
     {
@@ -49,16 +65,36 @@ PROVIDERS = [
     },
 ]
 
-_HTTP_TIMEOUT = (15, 90)
-_DETECTED = None  # {"provider": str, "base": str, "model": str}
+# Fallback pattern for chat-capable text models (never whisper/tts/guard).
+_CHAT_MODEL_RE = re.compile(
+    r"(llama|gpt-oss|qwen|kimi|gemma|grok|mistral|allam)", re.IGNORECASE
+)
+
+_HTTP_TIMEOUT = (15, 120)
+_DETECTED = None        # {"provider": str, "base": str, "model": str}
+_MODEL_OVERRIDE = None  # set via set_model_override() for QA runs
 
 
 def _headers() -> dict:
     return {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
 
 
+def _pick_model(ids) -> str:
+    """Choose the model: explicit override > preference list > first chat model."""
+    if _MODEL_OVERRIDE:
+        return _MODEL_OVERRIDE
+    for prov in PROVIDERS:
+        for m in prov["models"]:
+            if m in ids:
+                return m
+    for m in ids:
+        if _CHAT_MODEL_RE.search(m):
+            return m
+    return ids[0]
+
+
 def _detect():
-    """Find the first provider that accepts the key; pick the best model."""
+    """Find the provider that accepts the key; pick the best model."""
     global _DETECTED
     if _DETECTED is not None:
         return _DETECTED
@@ -75,14 +111,40 @@ def _detect():
             if not ids:
                 log.info("LLM provider %s returned no models", prov["name"])
                 continue
-            model = next((m for m in prov["models"] if m in ids), ids[0])
-            _DETECTED = {"provider": prov["name"], "base": prov["base"], "model": model}
-            log.info("LLM provider detected: %s (%s)", prov["name"], model)
+            _DETECTED = {"provider": prov["name"], "base": prov["base"],
+                         "model": _pick_model(ids)}
+            log.info("LLM provider detected: %s (%s)", prov["name"], _DETECTED["model"])
             return _DETECTED
         except requests.RequestException as exc:
             log.warning("LLM provider %s /models failed: %s", prov["name"], exc)
-    log.warning("No LLM provider accepted the API key — translation disabled (English-only posts)")
+    log.warning("No LLM provider accepted the API key — translation disabled")
     return None
+
+
+def set_model_override(model: str):
+    """Force a specific model id (used by the QA script to compare models)."""
+    global _MODEL_OVERRIDE, _DETECTED
+    _MODEL_OVERRIDE = (model or "").strip() or None
+    _DETECTED = None  # re-detect with the override in place
+
+
+def available_models() -> list:
+    """Model ids offered by the working provider (empty list if none)."""
+    for prov in PROVIDERS:
+        try:
+            r = requests.get(f"{prov['base']}/models", headers=_headers(), timeout=_HTTP_TIMEOUT)
+            if r.status_code == 200:
+                ids = [m.get("id") for m in (r.json().get("data") or []) if m.get("id")]
+                if ids:
+                    return ids
+        except requests.RequestException:
+            continue
+    return []
+
+
+def current_model() -> str:
+    det = _detect()
+    return det["model"] if det else ""
 
 
 def ask_llm(system: str, user: str, max_tokens: int = 2048, temperature: float = 0.3, retries: int = 3):
@@ -137,31 +199,104 @@ def parse_json_obj(text):
         return None
 
 
-def translate_fields(prompt: str, required_keys) -> dict:
-    """
-    Ask the LLM for a JSON object with the given keys (all must be non-empty
-    strings). Returns the dict, or None if anything failed — callers should
-    treat None as "fall back to English".
-    """
+# --------------------------------------------------------------------------- #
+#  Pass 1: translation draft                                                   #
+# --------------------------------------------------------------------------- #
+
+TRANSLATOR_SYSTEM = (
+    "You are a professional Persian (Farsi) science writer and translator for "
+    "a popular Iranian Telegram science channel. You always answer with valid "
+    "JSON only — no commentary, no markdown fences."
+)
+
+
+def translate_draft(prompt: str, required_keys, max_tokens: int = 2048,
+                    temperature: float = 0.35) -> dict:
+    """First pass: ask the LLM for a JSON object with the given keys."""
     det = _detect()
     if det is None:
         return None
-    system = (
-        "You are a professional English-to-Persian (Farsi) translator writing for a "
-        "popular Iranian Telegram science channel. You always answer with valid "
-        "JSON only — no commentary, no markdown fences."
-    )
-    raw = ask_llm(system, prompt)
+    raw = ask_llm(TRANSLATOR_SYSTEM, prompt, max_tokens=max_tokens,
+                  temperature=temperature)
     data = parse_json_obj(raw)
     if not data:
-        log.warning("LLM reply was not valid JSON — falling back to English")
+        log.warning("Draft translation was not valid JSON")
         return None
     for key in required_keys:
         value = data.get(key)
         if not isinstance(value, str) or not value.strip():
-            log.warning("LLM JSON missing key %r — falling back to English", key)
+            log.warning("Draft JSON missing key %r", key)
             return None
     return {k: str(data[k]).strip() for k in required_keys}
+
+
+# --------------------------------------------------------------------------- #
+#  Pass 2: strict Persian editor                                               #
+# --------------------------------------------------------------------------- #
+
+EDITOR_SYSTEM = (
+    "You are a strict, experienced Persian (Farsi) language editor (ویراستار) "
+    "for a popular Iranian science channel. You always answer with valid JSON "
+    "only — no commentary, no markdown fences."
+)
+
+
+def review_translation(english_source: str, draft: dict,
+                       max_tokens: int = 2048) -> dict:
+    """
+    Second pass: a strict Persian editor fixes the draft translation.
+
+    `english_source` is the ground-truth English text; `draft` is the parsed
+    JSON from pass 1. Returns the corrected dict (same keys), or None when
+    the editor call fails (callers then keep the draft as-is).
+    """
+    det = _detect()
+    if det is None or not draft:
+        return None
+    draft_json = json.dumps(draft, ensure_ascii=False, indent=1)
+    prompt = (
+        "Below are (1) the English source text — the ground truth — and "
+        "(2) a draft Persian translation as JSON.\n"
+        "Your job: correct the Persian translation so it becomes flawless, "
+        "natural Persian (فارسی صحیح و روان) — exactly what an educated "
+        "Iranian editor would publish.\n\n"
+        "Fix ALL of these problems wherever they exist:\n"
+        "1. meaningless, invented, or plainly wrong words — words no Iranian "
+        "would ever use in this sense → replace with the correct common word\n"
+        "2. non-standard scientific terms → use the standard Persian "
+        "terminology of Persian Wikipedia and Iranian science media\n"
+        "3. literal word-by-word translation (calque) from English → rewrite "
+        "the sentence naturally, translate the meaning\n"
+        "4. grammar errors: اضافهٔ کسره (hazfe), نیم‌فاصله, prepositions, "
+        "verb agreement, plurals\n"
+        "5. awkward word order, unnatural phrasing, translated-sounding text\n"
+        "6. numbers must be Persian digits (۰۱۲۳۴۵۶۷۸۹); fix broken "
+        "punctuation\n\n"
+        "Hard limits:\n"
+        "- Do NOT change the meaning; do NOT add or remove any fact.\n"
+        "- Keep the exact same JSON keys.\n"
+        "- Keep the same paragraph structure and length (±20%).\n"
+        "- Persian script only; well-known proper names in their common "
+        "Persian form (ناسا، تلسکوپ فضایی جیمز وب), other proper names in "
+        "Latin.\n\n"
+        f"English source:\n{english_source}\n\n"
+        f"Draft Persian translation (JSON):\n{draft_json}\n\n"
+        "Return ONLY the corrected JSON with the same keys."
+    )
+    raw = ask_llm(EDITOR_SYSTEM, prompt, max_tokens=max_tokens, temperature=0.2)
+    data = parse_json_obj(raw)
+    if not data:
+        log.warning("Editor pass returned invalid JSON — keeping the draft")
+        return None
+    out = {}
+    for key in draft:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = value.strip()
+    if not out:
+        log.warning("Editor pass dropped all keys — keeping the draft")
+        return None
+    return out
 
 
 def provider_report() -> str:
