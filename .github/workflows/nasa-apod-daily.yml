@@ -1,6 +1,8 @@
 name: NASA APOD Daily Post
 
-# Posts NASA's Astronomy Picture of the Day to the Telegram channel once a day.
+# Posts NASA's Astronomy Picture of the Day to the Telegram channel once a
+# day — as a Persian-only post (Grok/Groq translation, Jalali date, emoji +
+# hashtags).
 #   - Main run:   17:30 UTC = 21:00 (Tehran)
 #   - Backup run: 19:30 UTC = 23:00 (Tehran) — only posts if the main run
 #     failed, because state.json prevents duplicate posts.
@@ -13,6 +15,10 @@ on:
     inputs:
       force:
         description: "Re-post even if today's APOD was already posted"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Diagnostics: fetch + translate + print, do not post"
         type: boolean
         default: false
 
@@ -49,7 +55,7 @@ jobs:
           GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
           STATE_FILE: state.json
           FORCE_POST: ${{ inputs.force || 'false' }}
-        run: python nasa_apod_bot.py
+        run: python nasa_apod_bot.py ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: Save state file (duplicate protection + keeps repo active)
         if: always()
