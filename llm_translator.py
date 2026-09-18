@@ -39,20 +39,17 @@ log = logging.getLogger("llm-translator")
 API_KEY = (os.environ.get("GROK_API_KEY") or os.environ.get("LLM_API_KEY") or "").strip()
 
 # Models are tried in order; the first one offered by the provider wins.
-# Order rationale (revised after live QA on the channel translations):
-#   1. moonshotai/kimi-k2-instruct   — most natural, correct Persian prose
-#   2. openai/gpt-oss-120b           — solid, occasionally awkward wording
-#   3. meta-llama/llama-4-*          — good multilingual fallbacks
+# Order chosen after live QA (2026-09-18) comparing Persian quality:
+#   1. qwen/qwen3.8-27b    — most natural, correct Persian (winner)
+#   2. openai/gpt-oss-120b — decent backup, occasionally awkward wording
+# Never use gpt-oss-20b: it hallucinated a telescope name in the APOD post.
 PROVIDERS = [
     {
         "name": "Groq",
         "base": "https://api.groq.com/openai/v1",
         "models": [
-            "moonshotai/kimi-k2-instruct",
+            "qwen/qwen3.8-27b",
             "openai/gpt-oss-120b",
-            "meta-llama/llama-4-maverick-17b-128e-instruct",
-            "qwen/qwen3-32b",
-            "meta-llama/llama-4-scout-17b-16e-instruct",
             "openai/gpt-oss-20b",
             "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant",
@@ -158,11 +155,13 @@ def current_model() -> str:
 
 
 def ask_llm(system: str, user: str, max_tokens: int = 2048, temperature: float = 0.3,
-             retries: int = 3, model: str = None):
+             retries: int = 4, model: str = None):
     """Send one chat completion. Returns the reply text, or None on failure.
 
     `model` optionally overrides the detected model for this single call
-    (used to run the editor pass on a different model).
+    (used to run the editor pass on a different model). HTTP 429 gets a
+    long backoff: the active model (qwen3.8-27b) allows only ~1000 output
+    tokens per minute, so rate-limit windows need real time to roll over.
     """
     det = _detect()
     if det is None:
@@ -187,6 +186,20 @@ def ask_llm(system: str, user: str, max_tokens: int = 2048, temperature: float =
                 if content and content.strip():
                     return content.strip()
                 last_err = "empty completion"
+            elif r.status_code == 429:
+                # Rate limited — wait for the token window to actually roll
+                # over (Retry-After header wins when present).
+                wait = 30
+                try:
+                    wait = max(int(r.headers.get("retry-after") or 0), 20)
+                except (TypeError, ValueError):
+                    pass
+                last_err = f"HTTP 429: {r.text[:150]}"
+                if attempt < retries:
+                    log.warning("LLM rate-limited — sleeping %ds (attempt %d/%d)",
+                                wait, attempt, retries)
+                    time.sleep(wait)
+                    continue
             else:
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
                 if r.status_code in (400, 401, 403):
