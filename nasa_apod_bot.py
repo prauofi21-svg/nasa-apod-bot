@@ -261,35 +261,43 @@ def download_images(apod: dict, workdir: Path) -> list:
 
 def shrink_for_telegram(path: Path):
     """
-    Re-encode a large image so it fits Telegram's 10 MB photo limit.
-    Returns the new path, or None if shrinking was not possible.
+    Re-encode a large or oversized image for a Telegram *photo* upload.
+
+    Telegram limits photos to 10 MB AND to sane pixel dimensions
+    (width + height must stay small; huge panoramas are rejected with
+    PHOTO_INVALID_DIMENSIONS). We cap the longest side at 4000 px — far
+    above Telegram's own display resolution — and step quality down until
+    the file fits ~9.7 MB.
     """
     import io
 
-    target = 10 * 1024 * 1024 - 300 * 1024   # 9.7 MB with safety margin
-    if path.stat().st_size <= target:
-        return path
+    size_limit = 10 * 1024 * 1024 - 300 * 1024   # 9.7 MB with safety margin
+    max_side = 4000
     try:
         from PIL import Image
     except ImportError:
-        log.warning("Pillow not available — cannot shrink the image for photo upload")
+        log.warning("Pillow not available — cannot prepare the image for photo upload")
         return None
     try:
         with Image.open(path) as im:
             im = im.convert("RGB")
             width, height = im.size
-            for scale in (1.0, 0.9, 0.8, 0.7, 0.6, 0.5):
+            dim_scale = min(1.0, max_side / max(width, height))
+            if path.stat().st_size <= size_limit and dim_scale >= 1.0:
+                return path
+            for rel_scale in (1.0, 0.9, 0.8, 0.7, 0.6, 0.5):
+                scale = dim_scale * rel_scale
                 new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
-                frame = im if scale == 1.0 else im.resize(new_size, Image.LANCZOS)
+                frame = im if new_size == (width, height) else im.resize(new_size, Image.LANCZOS)
                 for quality in (90, 85, 80, 74, 68, 62):
                     buf = io.BytesIO()
                     frame.save(buf, "JPEG", quality=quality, optimize=True, progressive=True)
-                    if buf.tell() <= target:
+                    if buf.tell() <= size_limit:
                         out = path.with_name("apod_photo.jpg")
                         out.write_bytes(buf.getvalue())
                         log.info(
-                            "Image re-encoded to %.1f MB (scale %.2f, quality %d)",
-                            buf.tell() / 1e6, scale, quality,
+                            "Image re-encoded to %.1f MB, %dx%d (scale %.2f, quality %d)",
+                            buf.tell() / 1e6, new_size[0], new_size[1], scale, quality,
                         )
                         return out
     except Exception as exc:
@@ -314,7 +322,12 @@ def select_image(paths: list):
             return shrunk
     fitting = [p for p in paths if p.stat().st_size <= photo_limit]
     if fitting:
-        return max(fitting, key=lambda p: p.stat().st_size)
+        # Even a small file can have oversized pixel dimensions — run it
+        # through the dimension capper as well.
+        for p in sorted(fitting, key=lambda p: p.stat().st_size, reverse=True):
+            prepared = shrink_for_telegram(p)
+            if prepared:
+                return prepared
     return max(paths, key=lambda p: p.stat().st_size)
 
 
