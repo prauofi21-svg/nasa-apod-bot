@@ -59,7 +59,7 @@ except ImportError:
     YTDLP_AVAILABLE = False
 
 try:
-    from llm_translator import ask_llm, parse_json_obj
+    from llm_translator import ask_llm, parse_json_obj, review_translation
     from persian_utils import parse_hashtags, pick_emoji, pretty_date_fa, has_persian
     TRANSLATION_AVAILABLE = True
 except ImportError:
@@ -175,9 +175,9 @@ def build_persian_header(apod: dict, translation: dict, video_preview: bool = Fa
 
 
 APOD_TRANSLATION_SYSTEM = (
-    "You are the editor of a popular Persian-language science Telegram "
-    "channel. You always answer with valid JSON only — no commentary, no "
-    "markdown fences."
+    "You are a professional Persian (Farsi) science writer for a popular "
+    "Iranian Telegram science channel. You always answer with valid JSON "
+    "only — no commentary, no markdown fences."
 )
 
 DEFAULT_APOD_EMOJI = "🌌"
@@ -186,7 +186,8 @@ DEFAULT_APOD_TAGS = ["#نجوم", "#ناسا"]
 
 def translate_apod(apod: dict):
     """
-    Translate the APOD into sweet Persian and pick an emoji + hashtags.
+    Translate the APOD into flawless, sweet Persian (two passes: translator
+    + strict Persian editor) and pick an emoji + hashtags.
 
     Returns {'title_fa', 'explanation_fa', 'emoji', 'hashtags'} or None on
     any failure. Real runs treat None as fatal (Persian-only policy) and let
@@ -196,36 +197,67 @@ def translate_apod(apod: dict):
         return None
     title = (apod.get("title") or "").strip()
     explanation = normalize_explanation(apod.get("explanation"))
+    english_source = f"Title: {title}\n\nExplanation:\n{explanation}"
     prompt = (
         "Write today's channel post for this NASA Astronomy Picture of the "
-        "Day, in sweet, fluent, engaging Persian (فارسی شیرین) that Iranian "
-        "readers love — warm, precise, and easy to read on a phone.\n\n"
+        "Day, in beautiful, correct, natural Persian (فارسی صحیح و روان) — "
+        "exactly what a native Iranian science journalist would write for "
+        "millions of readers.\n\n"
         f"English title: {title}\n\n"
         f"English explanation:\n{explanation}\n\n"
-        "Rules:\n"
-        "- title_fa: an attractive, faithful Persian translation of the title\n"
+        "QUALITY RULES — all mandatory:\n"
+        "1. Translate the MEANING, never word-by-word. No calques of English "
+        "idioms; rewrite anything that sounds like a translation.\n"
+        "2. Use the standard Persian scientific terms of Persian Wikipedia "
+        "and Iranian science media — e.g. سیاه‌چاله، کهکشان، سحابی، "
+        "خوشهٔ ستاره‌ای، ابرنواختر، ستارهٔ نوترونی، رمبش گرانشی، طول موج، "
+        "طیف، مدار، جوّ سیاره‌ای.\n"
+        "3. NEVER invent Persian words. If a term has no established Persian "
+        "equivalent, describe it briefly in Persian and put the English term "
+        "in parentheses.\n"
+        "4. Perfect Persian grammar: اضافهٔ کسره (hazfe) written where needed "
+        "(ستارهٔ نوترونی، تصویرِ زیبا)، correct نیم‌فاصله (می‌رود، "
+        "به‌صورت)، correct prepositions, verb agreement, and plurals. Zero "
+        "tolerance for meaningless or misplaced words.\n"
+        "5. Every single word must make sense to an average Iranian reader; "
+        "if unsure about a word, use the everyday Persian word.\n"
+        "6. Persian script only; well-known proper names in their common "
+        "Persian form (ناسا، تلسکوپ فضایی جیمز وب، تلسکوپ هابل), other "
+        "proper names in Latin; numbers with Persian numerals "
+        "(۰۱۲۳۴۵۶۷۸۹).\n"
+        "7. No links, no markdown, no emojis inside title_fa/explanation_fa.\n\n"
+        "OUTPUT FIELDS:\n"
+        "- title_fa: an attractive, faithful Persian translation of the "
+        "title\n"
         "- explanation_fa: an engaging, accurate Persian rendering of the "
         "explanation in 2-5 short paragraphs; keep the substance complete; "
-        "friendly scientific tone; no links, no markdown, no emojis inside "
-        "the text\n"
-        "- emoji: exactly ONE emoji that fits this picture's subject (space or "
-        "astronomy themed, e.g. 🪐 🌌 🌠 🌞 ☄️) — nothing but the emoji\n"
-        "- hashtags: 2-4 Persian hashtags, space separated, each starting with "
-        "#; single tokens only (use _ inside a tag; no spaces, no ZWNJ); "
-        "highly relevant to THIS picture\n"
-        "- Persian script only; use the common Persian form of well-known "
-        "proper names (ناسا، تلسکوپ فضایی جیمز وب) and keep other proper "
-        "names in Latin; write numbers with Persian numerals (۰۱۲۳۴۵۶۷۸۹)\n\n"
+        "friendly scientific tone; short clear sentences\n"
+        "- emoji: exactly ONE emoji that fits this picture's subject (space "
+        "or astronomy themed, e.g. 🪐 🌌 🌠 🌞 ☄️) — nothing but the emoji\n"
+        "- hashtags: 2-4 Persian hashtags, space separated, each starting "
+        "with #; single tokens only (use _ inside a tag; no spaces, no "
+        "ZWNJ); highly relevant to THIS picture\n\n"
         'Respond ONLY as JSON: {"title_fa": "...", "explanation_fa": "...", '
         '"emoji": "...", "hashtags": "#... #..."}'
     )
     for attempt in (1, 2):
         raw = ask_llm(APOD_TRANSLATION_SYSTEM, prompt, max_tokens=2048,
-                      temperature=0.4)
+                      temperature=0.35)
         data = parse_json_obj(raw)
         if data:
             title_fa = str(data.get("title_fa") or "").strip().strip('"“”')
             explanation_fa = str(data.get("explanation_fa") or "").strip()
+            if title_fa and explanation_fa:
+                # Pass 2: strict Persian editor fixes wrong/meaningless words.
+                reviewed = review_translation(
+                    english_source,
+                    {"title_fa": title_fa, "explanation_fa": explanation_fa},
+                    max_tokens=2048,
+                )
+                if reviewed:
+                    title_fa = reviewed.get("title_fa", title_fa)
+                    explanation_fa = reviewed.get("explanation_fa", explanation_fa)
+                    log.info("Editor pass applied to the Persian translation")
             if (title_fa and explanation_fa and has_persian(title_fa)
                     and has_persian(explanation_fa) and len(explanation_fa) >= 80):
                 return {
