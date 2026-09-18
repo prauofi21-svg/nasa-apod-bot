@@ -52,6 +52,12 @@ try:
 except ImportError:
     YTDLP_AVAILABLE = False
 
+try:
+    from llm_translator import translate_fields
+    TRANSLATION_AVAILABLE = True
+except ImportError:
+    TRANSLATION_AVAILABLE = False
+
 # --------------------------------------------------------------------------- #
 #  Configuration                                                               #
 # --------------------------------------------------------------------------- #
@@ -133,6 +139,53 @@ def build_full_post(apod: dict, video_preview: bool = False) -> str:
     if CHANNEL_SIGNATURE:
         parts.append(f"— {CHANNEL_SIGNATURE}")
     return "\n\n".join(parts)
+
+
+def build_bilingual_header(apod: dict, translation: dict, video_preview: bool = False) -> str:
+    """Bilingual (Persian + English) caption for the media post."""
+    lines = [
+        "🌌 عکس نجومی روز ناسا | Astronomy Picture of the Day",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"✨ {translation['title_fa']}",
+        f"✨ {(apod.get('title') or 'Untitled').strip()}",
+        f"📅 {pretty_date(apod.get('date', ''))}",
+    ]
+    credit = " ".join((apod.get("copyright") or "").split())
+    if credit:
+        lines.append(f"🔭 Credit: {credit}")
+    if video_preview:
+        lines.append("🎞 امروز APOD یک ویدئو است — تصویر پیش‌نمایش | video day")
+    header = "\n".join(lines)
+    if len(header) > MAX_CAPTION_LEN:
+        header = header[: MAX_CAPTION_LEN - 1] + "…"
+    return header
+
+
+def translate_apod(apod: dict):
+    """
+    Translate the APOD title + explanation into engaging Persian via the LLM.
+    Returns {'title_fa': ..., 'explanation_fa': ...} or None on any failure
+    (callers fall back to the English-only post).
+    """
+    if not TRANSLATION_AVAILABLE:
+        return None
+    title = (apod.get("title") or "").strip()
+    explanation = normalize_explanation(apod.get("explanation"))
+    prompt = (
+        "Translate this NASA Astronomy Picture of the Day into engaging, natural "
+        "Persian (Farsi) for a Telegram science channel.\n\n"
+        f"Title: {title}\n\n"
+        f"Explanation:\n{explanation}\n\n"
+        "Rules:\n"
+        "- title_fa: an attractive, faithful Persian translation of the title\n"
+        "- explanation_fa: an engaging Persian translation of the explanation; "
+        "accurate, 2-4 short paragraphs, friendly scientific tone, easy to read "
+        "on a phone\n"
+        "- No links, no hashtags, no markdown symbols; keep proper names in Latin "
+        "where that is more natural; use Persian numerals where natural\n"
+        'Respond ONLY as JSON: {"title_fa": "...", "explanation_fa": "..."}'
+    )
+    return translate_fields(prompt, ("title_fa", "explanation_fa"))
 
 
 def split_text(text: str, limit: int = MAX_MESSAGE_LEN) -> list:
@@ -551,15 +604,34 @@ def save_state(apod: dict) -> None:
 #  Publishing                                                                  #
 # --------------------------------------------------------------------------- #
 
-def publish(apod: dict, media_path, video_preview: bool) -> None:
+def publish(apod: dict, media_path, video_preview: bool, translation: dict = None) -> None:
     """
     Post the APOD to the channel.
 
-    - If the whole post fits in a caption (<=1024 chars): one media post.
-    - Otherwise: media post with the header as caption + the explanation as
-      a follow-up text message.
-    - If no media could be downloaded: a single text post.
+    With a Persian translation available (recommended):
+      - media post with a bilingual caption (fa+en title, date, credit)
+      - follow-up message with the full Persian translation
+      - follow-up message with the English original
+    Without a translation: the classic English-only layout.
     """
+    if translation:
+        header = build_bilingual_header(apod, translation, video_preview)
+        if media_path is not None:
+            send_media(media_path, header)
+        else:
+            log.warning("No media available — sending the post as text only")
+            send_message(header)
+        time.sleep(1)
+        fa_text = "🇮🇷 ترجمه فارسی:\n\n" + translation["explanation_fa"]
+        if CHANNEL_SIGNATURE:
+            fa_text += f"\n\n— {CHANNEL_SIGNATURE}"
+        send_message(fa_text)
+        time.sleep(1)
+        en_explanation = normalize_explanation(apod.get("explanation"))
+        if en_explanation:
+            send_message("🌍 English original:\n\n" + en_explanation)
+        return
+
     full_post = build_full_post(apod, video_preview)
     if media_path is None:
         log.warning("No media available — sending the post as text only")
@@ -629,12 +701,24 @@ def main() -> int:
             return 0
 
     media_path, video_preview = prepare_media(apod)
+    translation = translate_apod(apod) if TRANSLATION_AVAILABLE else None
+    if translation:
+        log.info("Persian translation ready (%d chars)", len(translation["explanation_fa"]))
+    else:
+        log.info("No Persian translation — posting English-only")
 
     if args.dry_run:
         print("\n" + "=" * 62)
         print("POST PREVIEW (dry run — nothing was sent)")
         print("=" * 62)
-        print(build_full_post(apod, video_preview))
+        if translation:
+            print(build_bilingual_header(apod, translation, video_preview))
+            print("\n🇮🇷 ترجمه فارسی:\n\n" + translation["explanation_fa"])
+            en_explanation = normalize_explanation(apod.get("explanation"))
+            if en_explanation:
+                print("\n🌍 English original:\n\n" + en_explanation)
+        else:
+            print(build_full_post(apod, video_preview))
         print("=" * 62)
         if media_path:
             target = Path("apod_dry_run" + media_path.suffix)
@@ -644,7 +728,7 @@ def main() -> int:
             print("No media could be downloaded (the post would be text-only).")
         return 0
 
-    publish(apod, media_path, video_preview)
+    publish(apod, media_path, video_preview, translation)
     save_state(apod)
     log.info("Posted APOD for %s successfully.", apod.get("date"))
     return 0
