@@ -1,0 +1,72 @@
+name: Reddit Top Daily Post
+
+# Posts the day's top Reddit science posts (with Persian translations) to the
+# Telegram channel once a day.
+#   - Main run:   10:00 UTC = 13:30 (Tehran)
+#   - Backup run: 11:30 UTC = 15:00 (Tehran) — no-op if the main run already
+#     posted, because state_reddit.json prevents duplicate posts.
+
+on:
+  schedule:
+    - cron: "0 10 * * *"    # main run   (13:30 Tehran)
+    - cron: "30 11 * * *"   # backup run (15:00 Tehran)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Post even if these posts were already posted before"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Diagnostics: fetch + translate only, do not post"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # required to save state_reddit.json (duplicate protection)
+
+concurrency:
+  group: reddit-top-daily
+  cancel-in-progress: false
+
+jobs:
+  post:
+    name: Post Reddit Top 5 to Telegram
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch and post Reddit top
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+          SUBREDDITS: science+space+astronomy
+          POSTS_COUNT: "5"
+          MIN_SCORE: "50"
+          STATE_FILE: state_reddit.json
+          FORCE_POST: ${{ inputs.force || 'false' }}
+        run: python reddit_top_bot.py ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: Save state file (duplicate protection + keeps repo active)
+        if: always() && !inputs.dry_run
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state_reddit.json || true
+          if git diff --cached --quiet; then
+            echo "state_reddit.json unchanged — nothing to commit."
+          else
+            git commit -m "chore: update Reddit state [skip ci]"
+            git push
+          fi
