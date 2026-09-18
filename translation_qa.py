@@ -23,17 +23,16 @@ import logging
 import sys
 
 import llm_translator
-from llm_translator import available_models, set_model_override
+from llm_translator import available_models, set_editor_model, set_model_override
 from nasa_apod_bot import fetch_apod, translate_apod, validate_apod
 from reddit_top_bot import fetch_reddit_posts, pick_posts, translate_post
 
-CANDIDATES = [
-    "moonshotai/kimi-k2-instruct",
-    "openai/gpt-oss-120b",
-    "meta-llama/llama-4-maverick-17b-128e-instruct",
-    "qwen/qwen3-32b",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "openai/gpt-oss-20b",
+# (translator model, editor model or None = same model)
+CONFIGS = [
+    ("qwen/qwen3.8-27b", None),
+    ("qwen/qwen3.8-27b", "openai/gpt-oss-120b"),
+    ("openai/gpt-oss-120b", None),
+    ("openai/gpt-oss-20b", None),
 ]
 
 REDDIT_POSTS_TO_TEST = 2
@@ -69,10 +68,12 @@ def main() -> int:
 
     if args.models:
         to_test = [m.strip() for m in args.models.split(",") if m.strip()]
+        configs = [(m, None) for m in to_test]
     else:
-        to_test = [m for m in CANDIDATES if m in models]
-    banner(f"MODELS TO TEST: {', '.join(to_test)}")
-    if not to_test:
+        configs = [(t, e) for t, e in CONFIGS if t in models]
+    banner("CONFIGS TO TEST: "
+           + "; ".join(f"{t} + editor={e or t}" for t, e in configs))
+    if not configs:
         print("No candidate model is available — pass --models explicitly.")
         return 1
 
@@ -95,13 +96,15 @@ def main() -> int:
         print(f"Reddit fetch failed ({exc}) — testing APOD only.")
         posts = []
 
-    # --- run every candidate model on the same content ---------------------
+    # --- run every candidate config on the same content ---------------------
     import time
-    for index, model in enumerate(to_test):
+    for index, (translator_model, editor_model) in enumerate(configs):
         if index:
-            time.sleep(10)  # let rate-limit windows breathe between models
-        set_model_override(model)
-        banner(f"MODEL {index + 1}/{len(to_test)}: {model}")
+            time.sleep(10)  # let rate-limit windows breathe between configs
+        set_model_override(translator_model)
+        set_editor_model(editor_model)
+        banner(f"CONFIG {index + 1}/{len(configs)}: translator={translator_model} "
+               f"editor={editor_model or translator_model}")
 
         if apod is not None:
             print("\n--- APOD translation (translator + editor) ---", flush=True)
