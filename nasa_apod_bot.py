@@ -246,15 +246,18 @@ def translate_apod(apod: dict):
         "8. Ignore and drop any meta note about websites, links, or APOD "
         "site changes — never translate such notes.\n\n"
         "MANDATORY GLOSSARY — use exactly these established equivalents:\n"
+        "Messier 33 = مسیه ۳۳ (catalog name; NEVER مسیر/مسیری/مسی) | "
         "Andromeda = آندرومدا (NEVER آندروید) | Pinwheel Galaxy = کهکشان "
-        "فرفره | Triangulum Galaxy = کهکشان مثلث | Milky Way = راه شیری | "
-        "Local Group = گروه محلی | satellite galaxy = کهکشان ماهواره‌ای | "
+        "فرفره | Triangulum Galaxy = کهکشان مثلث | constellation = صورت‌فلکی "
+        "(NEVER صورت‌ستاره/ستاره‌پوش) | Milky Way = راه شیری (NEVER "
+        "راه‌پیمایی) | Local Group = گروه محلی | satellite galaxy = کهکشان "
+        "ماهواره‌ای | spiral arms = بازوهای مارپیچی (NEVER شاخ/بازوهای شل) | "
         "face-on (orientation) = روبه‌روی ناظر | star-forming region = منطقهٔ "
         "شکل‌گیری ستاره | star cluster = خوشهٔ ستاره‌ای | nebula = سحابی | "
-        "light-year = سال نوری | nebula NGC/IC names stay as NGC/IC | "
-        "James Webb Space Telescope = تلسکوپ فضایی جیمز وب | Hubble = هابل | "
-        "variable star = ستارهٔ متغیر | distance ladder/standard candle = "
-        "شمع استاندارد کیهانی\n\n"
+        "light-year = سال نوری | NGC/IC names stay as NGC/IC | "
+        "James Webb Space Telescope = تلسکوپ فضایی جیمز وب (ONLY when the "
+        "source actually says so) | Hubble = هابل | variable star = ستارهٔ "
+        "متغیر | cosmic ruler / standard candle = شمع استاندارد کیهانی\n\n"
         "OUTPUT FIELDS:\n"
         "- title_fa: an attractive, faithful Persian translation of the "
         "title\n"
@@ -627,7 +630,9 @@ def tg_api(method: str, data: dict = None, files: dict = None, timeout=HTTP_TIME
 def send_message(text: str) -> None:
     """Send a (possibly long) text message, split into chunks if needed."""
     for chunk in split_text(text):
-        tg_api("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": chunk})
+        payload = tg_api("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": chunk})
+        msg_id = (payload.get("result") or {}).get("message_id")
+        log.info("Telegram text message sent (id=%s)", msg_id)
         time.sleep(1)  # keep message ordering
 
 
@@ -638,24 +643,28 @@ def send_media(path: Path, caption: str) -> None:
     mime = mimetypes.guess_type(str(path))[0] or ("video/mp4" if is_video else "image/jpeg")
     try:
         with open(path, "rb") as fh:
-            tg_api(
+            payload = tg_api(
                 method,
                 {"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
                 files={field: (path.name, fh, mime)},
                 timeout=UPLOAD_TIMEOUT,
             )
+            msg_id = (payload.get("result") or {}).get("message_id")
+            log.info("Telegram media message sent (id=%s, %s)", msg_id, method)
             return
     except Exception as exc:
         if is_video:
             raise
         log.warning("sendPhoto failed (%s) — retrying as document", exc)
     with open(path, "rb") as fh:
-        tg_api(
+        payload = tg_api(
             "sendDocument",
             {"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
             files={"document": (path.name, fh, mime)},
             timeout=UPLOAD_TIMEOUT,
         )
+        msg_id = (payload.get("result") or {}).get("message_id")
+        log.info("Telegram document message sent (id=%s)", msg_id)
 
 
 def detect_chat() -> int:
