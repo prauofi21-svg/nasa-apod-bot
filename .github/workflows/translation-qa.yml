@@ -1,0 +1,52 @@
+name: Translation QA
+
+# Manual harness: compares candidate LLM models on the real APOD + top
+# Reddit posts using the production prompts (translator + editor passes)
+# and prints the full Persian output to the job log. Nothing is posted and
+# no state file is touched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "Comma-separated model ids to compare (empty = auto)"
+        type: string
+        default: ""
+      list_only:
+        description: "Only print the provider's model list"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: translation-qa
+  cancel-in-progress: false
+
+jobs:
+  qa:
+    name: Compare translation models
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run translation QA
+        env:
+          NASA_API_KEY: ${{ secrets.NASA_API_KEY }}
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+        run: |
+          python translation_qa.py \
+            ${{ inputs.models && format('--models "{0}"', inputs.models) || '' }} \
+            ${{ inputs.list_only && '--list-only' || '' }}
