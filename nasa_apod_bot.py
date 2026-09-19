@@ -28,7 +28,9 @@ Required environment variables (stored as GitHub Secrets):
     GROK_API_KEY         LLM API key (Groq or xAI) for the Persian translation
 
 Optional environment variables:
-    CHANNEL_SIGNATURE       footer text, e.g. "@YourChannel" (default: empty)
+    CHANNEL_SIGNATURE       channel handle appended to the end of every
+                            post, exactly two lines below the last word
+                            (default: "@daily_sciences")
     SEND_VIDEO_IF_POSSIBLE  "true" (default) / "false" — upload the real video
                             file on video days (falls back to preview image)
     STATE_FILE              de-duplication state path (default: state.json)
@@ -73,7 +75,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 NASA_API_KEY = os.environ.get("NASA_API_KEY", "").strip()
 
-CHANNEL_SIGNATURE = os.environ.get("CHANNEL_SIGNATURE", "").strip()
+CHANNEL_SIGNATURE = os.environ.get("CHANNEL_SIGNATURE", "@daily_sciences").strip()
 SEND_VIDEO_IF_POSSIBLE = os.environ.get(
     "SEND_VIDEO_IF_POSSIBLE", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
@@ -91,6 +93,42 @@ NASA_RETRIES = 12                    # legacy cap — fetch_apod uses its own cy
 TG_RETRIES = 5
 
 log = logging.getLogger("apod-bot")
+
+
+# --------------------------------------------------------------------------- #
+#  Channel signature                                                            #
+# --------------------------------------------------------------------------- #
+
+def append_signature(text: str) -> str:
+    """
+    Append the channel handle exactly two lines below the last word
+    (one blank line in between), e.g.:
+
+        ...آخرین کلمهٔ پست
+
+        @daily_sciences
+
+    The handle is kept plain (no dash, no quotes) so Telegram renders it as
+    a clickable link to the channel. Empty text or an empty signature
+    setting returns the text unchanged.
+    """
+    text = (text or "").rstrip()
+    if not CHANNEL_SIGNATURE or not text:
+        return text
+    return f"{text}\n\n{CHANNEL_SIGNATURE}"
+
+
+def fit_caption(text: str) -> str:
+    """
+    Same as append_signature, but safe for media captions: it reserves room
+    for the handle and truncates the body (never the handle) so the final
+    caption always stays within Telegram's caption limit.
+    """
+    text = (text or "").rstrip()
+    reserve = len(CHANNEL_SIGNATURE) + 2 if CHANNEL_SIGNATURE else 0
+    if reserve and len(text) + reserve > MAX_CAPTION_LEN:
+        text = text[: MAX_CAPTION_LEN - reserve - 1].rstrip() + "…"
+    return append_signature(text)
 
 
 # --------------------------------------------------------------------------- #
@@ -162,7 +200,7 @@ def build_full_post(apod: dict, video_preview: bool = False) -> str:
     if explanation:
         parts.append(explanation)
     if CHANNEL_SIGNATURE:
-        parts.append(f"— {CHANNEL_SIGNATURE}")
+        parts.append(CHANNEL_SIGNATURE)
     return "\n\n".join(parts)
 
 
@@ -186,10 +224,8 @@ def build_persian_header(apod: dict, translation: dict, video_preview: bool = Fa
     if tags:
         lines.append("")
         lines.append(" ".join(tags))
-    header = "\n".join(lines)
-    if len(header) > MAX_CAPTION_LEN:
-        header = header[: MAX_CAPTION_LEN - 1] + "…"
-    return header
+    # channel handle: exactly two lines below the last word, never truncated
+    return fit_caption("\n".join(lines))
 
 
 APOD_TRANSLATION_SYSTEM = (
@@ -747,8 +783,7 @@ def publish(apod: dict, media_path, video_preview: bool, translation: dict = Non
             send_message(header)
         time.sleep(1)
         fa_text = translation["explanation_fa"]
-        if CHANNEL_SIGNATURE:
-            fa_text = f"{fa_text}\n\n— {CHANNEL_SIGNATURE}"
+        fa_text = append_signature(fa_text)
         if fa_text:
             send_message(fa_text)
         return
@@ -765,8 +800,7 @@ def publish(apod: dict, media_path, video_preview: bool, translation: dict = Non
     send_media(media_path, build_header(apod, video_preview))
     time.sleep(1)
     explanation = normalize_explanation(apod.get("explanation"))
-    if CHANNEL_SIGNATURE:
-        explanation = f"{explanation}\n\n— {CHANNEL_SIGNATURE}" if explanation else f"— {CHANNEL_SIGNATURE}"
+    explanation = append_signature(explanation) if explanation else CHANNEL_SIGNATURE
     if explanation:
         send_message(explanation)
 
@@ -844,7 +878,7 @@ def main() -> int:
         print("=" * 62)
         if translation:
             print(build_persian_header(apod, translation, video_preview))
-            print("\n" + translation["explanation_fa"])
+            print("\n" + append_signature(translation["explanation_fa"]))
         else:
             print(build_full_post(apod, video_preview))
         print("=" * 62)
