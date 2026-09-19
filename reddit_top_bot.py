@@ -70,6 +70,8 @@ from persian_utils import has_persian, humanize_fa, parse_hashtags, pick_emoji
 # reuse the battle-tested Telegram helpers from the NASA bot
 from nasa_apod_bot import (
     MAX_CAPTION_LEN,
+    append_signature,
+    fit_caption,
     shrink_for_telegram,
     split_text,
     send_media,
@@ -85,7 +87,7 @@ POSTS_COUNT = int(os.environ.get("POSTS_COUNT", "5"))
 MIN_SCORE = int(os.environ.get("MIN_SCORE", "50"))
 MIRROR_HOURS = int(os.environ.get("MIRROR_HOURS", "54"))
 STATE_FILE = os.environ.get("STATE_FILE", "state_reddit.json").strip()
-CHANNEL_SIGNATURE = os.environ.get("CHANNEL_SIGNATURE", "").strip()
+CHANNEL_SIGNATURE = os.environ.get("CHANNEL_SIGNATURE", "@daily_sciences").strip()
 
 REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "").strip()
 REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
@@ -412,15 +414,13 @@ def build_post_text(post: dict, translation: dict) -> str:
     if translation.get("hashtags"):
         lines.append("")
         lines.append(" ".join(translation["hashtags"]))
-    if CHANNEL_SIGNATURE:
-        lines.append("")
-        lines.append(f"— {CHANNEL_SIGNATURE}")
-    return "\n".join(lines)
+    # channel handle: exactly two lines below the last word
+    return append_signature("\n".join(lines))
 
 
 def build_caption(post: dict, translation: dict) -> str:
     """Media caption: the full text if it fits, otherwise a compact version."""
-    full = build_post_text(post, translation)
+    full = build_post_text(post, translation)  # already ends with the handle
     if len(full) <= MAX_CAPTION_LEN:
         return full
     compact_lines = [
@@ -432,8 +432,8 @@ def build_caption(post: dict, translation: dict) -> str:
     if translation.get("hashtags"):
         compact_lines.append("")
         compact_lines.append(" ".join(translation["hashtags"]))
-    compact = "\n".join(compact_lines)
-    return compact[: MAX_CAPTION_LEN - 1] + "…" if len(compact) > MAX_CAPTION_LEN else compact
+    # compact caption keeps the handle too (never truncated away)
+    return fit_caption("\n".join(compact_lines))
 
 
 def download_preview(url: str, workdir: Path):
