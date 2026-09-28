@@ -1,0 +1,97 @@
+name: Fix channel media
+
+# One-off repair tool: replace the photo of an already-posted channel
+# message (editMessageMedia) while preserving its exact caption.
+#
+# Run manually (Actions → Run workflow) with:
+#   message_id   — the channel message whose photo should be replaced
+#   image_url    — the new image URL (validated with Pillow before edit)
+#   caption_file — repo file containing the caption to keep (default
+#                  fix-caption.txt). MUST exist, otherwise the caption
+#                  would be wiped by the edit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      message_id:
+        description: "message_id of the channel post to fix"
+        required: true
+      image_url:
+        description: "URL of the replacement image"
+        required: true
+      caption_file:
+        description: "repo file with the caption to preserve"
+        required: false
+        default: "fix-caption.txt"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fix-media
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests Pillow
+
+      - name: Replace message media
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MESSAGE_ID: ${{ inputs.message_id }}
+          IMAGE_URL: ${{ inputs.image_url }}
+          CAPTION_FILE: ${{ inputs.caption_file }}
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          import requests
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat_id = os.environ["TELEGRAM_CHAT_ID"]
+          message_id = int(os.environ["MESSAGE_ID"])
+          image_url = os.environ["IMAGE_URL"]
+          caption_file = os.environ["CAPTION_FILE"]
+
+          caption = Path(caption_file).read_text(encoding="utf-8").strip()
+          if not caption:
+              print("ERROR: caption file is empty — refusing to wipe the caption")
+              sys.exit(1)
+
+          r = requests.get(image_url, timeout=(30, 120))
+          r.raise_for_status()
+          data = r.content
+          print(f"downloaded {len(data)} bytes from {image_url}")
+
+          from PIL import Image
+          import io
+          with Image.open(io.BytesIO(data)) as im:
+              print(f"image OK: {im.format} {im.size[0]}x{im.size[1]}")
+
+          media = json.dumps({
+              "type": "photo",
+              "media": "attach://photo",
+              "caption": caption,
+          })
+          resp = requests.post(
+              f"https://api.telegram.org/bot{token}/editMessageMedia",
+              data={"chat_id": chat_id, "message_id": message_id, "media": media},
+              files={"photo": ("fixed.jpg", data, "image/jpeg")},
+              timeout=120,
+          )
+          payload = resp.json()
+          print("HTTP", resp.status_code, json.dumps(payload, ensure_ascii=False)[:400])
+          if not payload.get("ok"):
+              sys.exit(1)
+          print(f"media of message {message_id} replaced successfully")
+          PY
