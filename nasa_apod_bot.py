@@ -431,13 +431,48 @@ def validate_apod(apod: dict) -> None:
 #  Media downloaders                                                           #
 # --------------------------------------------------------------------------- #
 
+def _image_size_ok(data: bytes):
+    """Validate downloaded image bytes by DECODING them (Pillow).
+
+    Returns (ok, width, height). A tiny FILE is perfectly fine — a
+    solid-color JPEG compresses to a few KB (APOD "Cosmic Latte" is a
+    genuine 960x640 image at 7.5 KB), so byte size alone must never
+    disqualify an image. What matters: it decodes and is not a thumbnail
+    or placeholder (APOD images are always >= ~600 px wide).
+    """
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            width, height = im.size
+        ok = width >= 400 and height >= 240
+        return ok, width, height
+    except Exception:
+        return False, 0, 0
+
+
 def download_images(apod: dict, workdir: Path) -> list:
-    """Download all APOD image variants (HD first, SD as backup)."""
+    """Download APOD image candidates in priority order.
+
+    Order: hdurl, url, then — if the only URLs carry NASA's "_annotated"
+    overlay (site-move notice burned into the pixels) — the clean variant
+    guessed from the annotated one. Each candidate is validated by
+    actually decoding it; a failed or thumbnail-sized candidate is skipped.
+    """
     candidates = []
     for key in ("hdurl", "url"):
         value = apod.get(key)
         if value and value not in candidates:
             candidates.append(value)
+    # prefer the clean version of an annotated URL over the annotated one
+    expanded = []
+    for url in candidates:
+        expanded.append(url)
+        if "_annotated" in url:
+            clean = url.replace("_annotated", "")
+            if clean not in expanded:
+                expanded.insert(len(expanded) - 1, clean)
+    candidates = expanded
     paths = []
     for idx, url in enumerate(candidates):
         try:
@@ -449,9 +484,16 @@ def download_images(apod: dict, workdir: Path) -> list:
                 log.warning("Skipping non-image Content-Type %r", content_type)
                 continue
             data = resp.content
-            if len(data) < 10_000:
+            if len(data) < 1_000:
                 log.warning("File too small (%d bytes) — skipping", len(data))
                 continue
+            ok, width, height = _image_size_ok(data)
+            if not ok:
+                log.warning(
+                    "Image unusable (%dx%d, %d bytes) — skipping", width, height, len(data)
+                )
+                continue
+            log.info("Image OK: %dx%d, %d bytes", width, height, len(data))
             if len(data) > MAX_FILE_SIZE:
                 log.warning("File too large (%.1f MB) — trying next candidate", len(data) / 1e6)
                 continue
@@ -514,26 +556,19 @@ def shrink_for_telegram(path: Path):
 def select_image(paths: list):
     """
     Pick the best image for a Telegram *photo* post.
-    1. If a big variant exists, try to shrink it (keeps the most detail).
-    2. Otherwise use the largest variant that already fits the photo limit.
-    3. As a last resort return the biggest file (sent as a document).
+    paths arrive in PRIORITY order (hdurl / clean variant first) — take the
+    first one that survives dimension/size preparation. Choosing by file
+    size used to backfire: on days when NASA ships a redirect notice
+    burned into the low-res variant ("_annotated"), its extra bytes made it
+    LARGER than the genuine picture, so it won. Only if no candidate can be
+    prepared, fall back to the biggest file (sent as a document).
     """
-    photo_limit = 10 * 1024 * 1024 - 300 * 1024
     if not paths:
         return None
-    oversize = [p for p in paths if p.stat().st_size > photo_limit]
-    if oversize:
-        shrunk = shrink_for_telegram(max(oversize, key=lambda p: p.stat().st_size))
-        if shrunk:
-            return shrunk
-    fitting = [p for p in paths if p.stat().st_size <= photo_limit]
-    if fitting:
-        # Even a small file can have oversized pixel dimensions — run it
-        # through the dimension capper as well.
-        for p in sorted(fitting, key=lambda p: p.stat().st_size, reverse=True):
-            prepared = shrink_for_telegram(p)
-            if prepared:
-                return prepared
+    for p in paths:
+        prepared = shrink_for_telegram(p)
+        if prepared:
+            return prepared
     return max(paths, key=lambda p: p.stat().st_size)
 
 
