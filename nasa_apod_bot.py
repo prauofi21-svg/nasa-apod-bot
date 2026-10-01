@@ -40,6 +40,7 @@ Optional environment variables:
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import mimetypes
@@ -164,16 +165,42 @@ def build_header(apod: dict, video_preview: bool = False) -> str:
 
 
 APOD_META_RE = re.compile(
-    r"(?i)(apod\.nasa\.gov|science\.nasa\.gov|\bnew\s+apod\s+site\b)"
+    r"(?i)(apod\.nasa\.gov|science\.nasa\.gov|\bnew\s+apod\s+site\b"
+    r"|\bapod'?s?\s+e-?mail\b|\bapod\s+submissions?\b"
+    r"|\btomorrow'?s?\s+(?:picture|image|photo)\b)"
 )
+
+# Formulaic APOD meta notes, cut from the explanation BEFORE sentence-level
+# filtering. NASA's website serves them with irregular punctuation (e.g.
+# "... has moved : From apod.nasa.gov to science.nasa.gov/apod"), which the
+# sentence filter alone cannot split cleanly. Order matters: the site-move
+# note must go before "Please see" so domains are never half-eaten.
+APOD_META_SUBS = [
+    # "APOD's email (address) for image submissions has changed."
+    re.compile(r"(?i)\s*\bAPOD'?s?\s+e-?mail\b[^.!?]*(?:[.!?]+\s*|\s*$)"),
+    # "APOD's main NASA site has moved: from apod.nasa.gov to science.nasa.gov/apod"
+    re.compile(
+        r"(?i)\s*\bAPOD'?s?\s+main\s+(?:NASA\s+)?site\b[^.!?]*?\bmoved\b"
+        r"[^.!?]*?(?:from\s+)?\S*nasa\.gov\S*"
+        r"(?:\s*to\s*\S*nasa\.gov\S*)?[.!?]*\s*"
+    ),
+    # "Please see: APOD Submissions"
+    re.compile(r"(?i)\s*\bPlease\s+see\b[^.!?]*(?:[.!?]+\s*|\s*$)"),
+    # trailer: "Tomorrow's picture: <clue>" (always the final note)
+    re.compile(r"(?i)\s*\bTomorrow'?s?\s+(?:picture|image|photo)\b\s*:?.*$"),
+]
 
 
 def strip_apod_meta(text: str) -> str:
     """
-    Remove APOD website meta notes (e.g. "the main APOD site has moved to
-    science.nasa.gov/apod") — irrelevant noise for the channel post.
+    Remove APOD website meta notes (site-move / email-change / submission
+    notes and the "Tomorrow's picture" trailer) — irrelevant noise that must
+    never reach the Persian translation.
     """
     text = text or ""
+    for sub in APOD_META_SUBS:
+        text = sub.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
     if not APOD_META_RE.search(text):
         return text
     sentences = re.split(r"(?<=[.!?])\s+", text)
@@ -380,6 +407,7 @@ def fetch_apod() -> dict:
     today = datetime.now(timezone.utc).date()
     candidates = [None] + [(today - timedelta(days=n)).isoformat() for n in range(1, 4)]
     last_error = None
+    scrape_budget = 3   # web-recovery attempts allowed across the whole fetch
     for cycle in range(1, 4):
         for cand in candidates:
             for _ in range(2):  # two quick tries per candidate
@@ -393,6 +421,27 @@ def fetch_apod() -> dict:
                     except ValueError:
                         payload = None
                     if resp.status_code == 200 and isinstance(payload, dict) and payload.get("url"):
+                        if is_apod_placeholder(payload):
+                            # Migration-era glitch: the record echoes the
+                            # requested date but carries the site logo. NEVER
+                            # post it — and never let the day-walkback accept
+                            # it (the echoed dates defeat the duplicate guard
+                            # and caused double posts). Recover the real
+                            # entry from the website instead.
+                            if scrape_budget > 0:
+                                scrape_budget -= 1
+                                log.warning(
+                                    "NASA API served a placeholder record for %s — "
+                                    "recovering the real APOD from science.nasa.gov",
+                                    payload.get("date") or "today",
+                                )
+                                recovered = scrape_apod_web()
+                                if recovered:
+                                    return recovered
+                            last_error = RuntimeError(
+                                "NASA API placeholder; web recovery failed"
+                            )
+                            continue
                         if cand:
                             log.warning(
                                 "Latest APOD unavailable — using the %s entry instead", cand
@@ -425,6 +474,181 @@ def validate_apod(apod: dict) -> None:
         raise RuntimeError("APOD response has no media url")
     if not apod.get("title"):
         raise RuntimeError("APOD response has no title")
+
+
+# --------------------------------------------------------------------------- #
+#  Web recovery (NASA API placeholder glitch)                                  #
+# --------------------------------------------------------------------------- #
+
+APOD_WEB_HOME = "https://science.nasa.gov/apod/"
+WEB_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+}
+WEB_MONTHS = {m.lower(): i for i, m in enumerate(
+    ["January", "February", "March", "April", "May", "June", "July",
+     "August", "September", "October", "November", "December"], 1)}
+
+
+def is_apod_placeholder(apod: dict) -> bool:
+    """
+    Detect the placeholder record NASA's APOD API has been serving during
+    the science.nasa.gov migration: it echoes any requested date, but the
+    title is generic ("NASA Science") and the media URLs point at the site
+    logo. Posting one means a text-only post with a wrong title — and the
+    echoed dates also poison the day-walkback duplicate protection.
+    """
+    title = (apod.get("title") or "").strip().lower()
+    urls = " ".join(x or "" for x in (apod.get("url"), apod.get("hdurl"))).lower()
+    if title == "nasa science":
+        return True
+    if "nasa-logo" in urls or "/wp-content/themes/" in urls:
+        return True
+    return False
+
+
+def _web_get(session, url, validate=None, tries=4):
+    """GET with retries. `validate` lets callers retry soft-404 pages —
+    NASA's CDN sometimes serves a "Page not found" body with HTTP 200
+    (rate-limiting) instead of a proper 429."""
+    for attempt in range(tries):
+        try:
+            resp = session.get(url, timeout=HTTP_TIMEOUT, headers=WEB_HEADERS)
+            if resp.status_code == 200 and (validate is None or validate(resp)):
+                return resp
+            log.warning("Web fetch %s -> HTTP %s (attempt %d/%d)",
+                        url[:80], resp.status_code, attempt + 1, tries)
+        except requests.RequestException as exc:
+            log.warning("Web fetch %s failed (%s, attempt %d/%d)",
+                        url[:80], exc, attempt + 1, tries)
+        time.sleep(3)
+    return None
+
+
+def _is_apod_article(resp) -> bool:
+    m = re.search(r"<title>(.*?)</title>", resp.text, re.S)
+    title = html.unescape(m.group(1)).strip() if m else ""
+    return "APOD:" in title and "Page not found" not in title
+
+
+def scrape_apod_web() -> dict | None:
+    """
+    Recover the REAL current APOD from science.nasa.gov when the API serves
+    its placeholder record. The website always carries the genuine daily
+    entry as an "image-article" page. Returns an API-shaped dict, or None.
+    """
+    session = requests.Session()
+    home = _web_get(session, APOD_WEB_HOME)
+    if home is None:
+        return None
+    # daily APOD entries look like /image-article/apod-2026-october-1-<slug>/
+    entries = []
+    for href in re.findall(
+            r'href="(https?://science\.nasa\.gov/(?:image-article/)+apod-[^"]+)"',
+            home.text):
+        m = re.search(r"/apod-(\d{4})-([a-z]+)-(\d{1,2})(?:-|/|$)", href)
+        if not m:
+            continue
+        month = WEB_MONTHS.get(m.group(2).lower())
+        if not month:
+            continue
+        date = f"{m.group(1)}-{month:02d}-{int(m.group(3)):02d}"
+        if (date, href) not in entries:
+            entries.append((date, href))
+    if not entries:
+        log.warning("APOD homepage: no daily article links found")
+        return None
+    date, href = max(entries, key=lambda e: e[0])
+    article = _web_get(session, href, validate=_is_apod_article)
+    if article is None:
+        return None
+    txt = article.text
+
+    # --- title + date from og:title ("APOD: 2026 October 1 - <Title>") ---
+    og = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]*)"', txt)
+    og_title = html.unescape(og.group(1)) if og else ""
+    m = re.search(
+        r"APOD:\s*(\d{4})\s+([A-Za-z]+)\s+(\d{1,2})\s*[-\u2013]\s*(.+?)"
+        r"\s*(?:-\s*NASA Science)?\s*$",
+        og_title,
+    )
+    if not m:
+        log.warning("APOD article: could not parse og:title %r", og_title[:80])
+        return None
+    year, month_name, day, title = m.groups()
+    month = WEB_MONTHS.get(month_name.lower())
+    if not month:
+        return None
+    date = f"{year}-{month:02d}-{int(day):02d}"
+
+    # --- explanation ---
+    explanation = ""
+    m = re.search(r"Explanation:\s*</strong>(.*?)</p>", txt, re.S)
+    if m:
+        explanation = html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))
+        explanation = re.sub(r"\s+", " ", explanation).strip()
+
+    # --- credit ("Credit & Copyright" table row) ---
+    credit = ""
+    m = re.search(
+        r"Credit\s*(?:&|&amp;)\s*Copyright\s*</th>\s*<td[^>]*>\s*(.*?)\s*</td>",
+        txt, re.S)
+    if m:
+        credit = html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))
+        credit = re.sub(r"\s+", " ", credit).strip()
+
+    # --- image candidates ---
+    ogi = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]*)"', txt)
+    og_image = html.unescape(ogi.group(1)) if ogi else ""
+    # original file = og:image without the /jcr:content/renditions/... suffix
+    dam_original = re.sub(r"/jcr:content/renditions/.*$", "", og_image) if og_image else ""
+    # dynamicimage base URL from the JSON-LD NewsArticle block
+    dyn = ""
+    for ld in re.findall(
+            r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', txt, re.S):
+        try:
+            data = json.loads(ld)
+        except ValueError:
+            continue
+        graphs = data.get("@graph") if isinstance(data, dict) else None
+        for g in (graphs or ([data] if isinstance(data, dict) else [])):
+            if not isinstance(g, dict) or g.get("@type") != "NewsArticle":
+                continue
+            img = g.get("image") or {}
+            for key in ("url", "@id"):
+                u = img.get(key) if isinstance(img, dict) else None
+                if u:
+                    dyn = html.unescape(str(u).split("?")[0])
+                    break
+            if dyn:
+                break
+        if dyn:
+            break
+
+    candidates = []
+    for u in (dam_original, dyn, og_image):
+        if not u or u in candidates:
+            continue
+        if "logo" in u.lower() or "/wp-content/themes/" in u.lower():
+            continue
+        candidates.append(u)
+    if not candidates:
+        log.warning("APOD article %s: no usable image URL found", date)
+        return None
+
+    log.info("Web recovery: %s — %s (credit: %s)", date, title, credit or "?")
+    return {
+        "date": date,
+        "title": title.strip(),
+        "explanation": explanation,
+        "media_type": "image",
+        "url": candidates[0],
+        "hdurl": candidates[0],
+        "copyright": credit,
+        "service_version": "web-recovery",
+        "extra_image_urls": candidates[1:],
+        "source": "science.nasa.gov",
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -473,6 +697,10 @@ def download_images(apod: dict, workdir: Path) -> list:
             if clean not in expanded:
                 expanded.insert(len(expanded) - 1, clean)
     candidates = expanded
+    # web-recovery entries may carry extra validated candidates
+    for url in (apod.get("extra_image_urls") or []):
+        if url and url not in candidates:
+            candidates.append(url)
     paths = []
     for idx, url in enumerate(candidates):
         try:
@@ -891,6 +1119,15 @@ def main() -> int:
             return 0
 
     media_path, video_preview = prepare_media(apod)
+    if media_path is None and not args.dry_run:
+        # Channel policy (2026-10-01): a NASA post without its picture is a
+        # broken post. Fail the run instead of publishing text-only — the
+        # backup cron run retries, and state.json stays untouched so nothing
+        # is marked as posted.
+        raise RuntimeError(
+            "No usable media prepared for this APOD — aborting instead of "
+            "posting text-only; the backup run will retry"
+        )
     translation = translate_apod(apod) if TRANSLATION_AVAILABLE else None
     if translation:
         log.info("Persian translation ready (%d chars, emoji %s, %d hashtags)",
