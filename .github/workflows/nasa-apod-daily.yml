@@ -3,14 +3,28 @@ name: NASA APOD Daily Post
 # Posts NASA's Astronomy Picture of the Day to the Telegram channel once a
 # day — as a Persian-only post (Grok/Groq translation, Jalali date, emoji +
 # hashtags).
+#
+# Schedule resilience: GitHub Actions silently DROPS scheduled runs during
+# high-load windows (it dropped BOTH slots on 2026-10-03, leaving the channel
+# without its daily post). Because state.json makes every extra run a cheap
+# no-op ("already posted — nothing to do"), we spread SEVEN chances across
+# the evening plus one next-morning safety net. Off-the-hour minutes are used
+# on purpose — :00 and :30 marks are GitHub's most congested slots.
 #   - Main run:   17:30 UTC = 21:00 (Tehran)
-#   - Backup run: 19:30 UTC = 23:00 (Tehran) — only posts if the main run
-#     failed, because state.json prevents duplicate posts.
+#   - Backups:    18:15, 19:05, 19:30, 20:15, 20:45, 21:20 UTC
+#   - Safety net: 09:40 UTC next morning (rare: fires only if ALL evening
+#                 slots were dropped)
 
 on:
   schedule:
-    - cron: "30 17 * * *"   # main run  (21:00 Tehran)
-    - cron: "30 19 * * *"   # backup run (23:00 Tehran, skips if already posted)
+    - cron: "30 17 * * *"   # main run   (21:00 Tehran)
+    - cron: "15 18 * * *"   # backup 1   (21:45 Tehran)
+    - cron: "5 19 * * *"    # backup 2   (22:35 Tehran)
+    - cron: "30 19 * * *"   # backup 3   (23:00 Tehran)
+    - cron: "15 20 * * *"   # backup 4   (23:45 Tehran)
+    - cron: "45 20 * * *"   # backup 5   (00:15 Tehran)
+    - cron: "20 21 * * *"   # backup 6   (00:50 Tehran)
+    - cron: "40 9 * * *"    # safety net (14:10 Tehran, catches total miss)
   workflow_dispatch:
     inputs:
       force:
