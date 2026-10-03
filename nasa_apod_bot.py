@@ -588,14 +588,30 @@ def scrape_apod_web() -> dict | None:
         explanation = html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))
         explanation = re.sub(r"\s+", " ", explanation).strip()
 
-    # --- credit ("Credit & Copyright" table row) ---
+    # --- credit (the article meta table has used several label variants) ---
     credit = ""
-    m = re.search(
-        r"Credit\s*(?:&|&amp;)\s*Copyright\s*</th>\s*<td[^>]*>\s*(.*?)\s*</td>",
-        txt, re.S)
-    if m:
-        credit = html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))
-        credit = re.sub(r"\s+", " ", credit).strip()
+    for pat in (
+            # 2026-10 layout: <th ...>Credit:</th><td ...>
+            #   <strong>Image Credit:</strong> <a ...>NASA</a>, ...</td>
+            r"Credit:?\s*</th>\s*<td[^>]*>(.*?)</td>",
+            # legacy layout: <th ...>Credit &amp; Copyright</th><td>...</td>
+            r"Credit\s*(?:&|&amp;)\s*Copyright\s*</th>\s*<td[^>]*>\s*(.*?)\s*</td>",
+            # last resort: bolded inline label
+            r"<strong>\s*Image\s*Credit(?:\s*(?:&|&amp;|and)\s*Copyright)?"
+            r"\s*:\s*</strong>(.*?)</(?:p|td|div)>"):
+        m = re.search(pat, txt, re.S)
+        if m:
+            credit = html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))
+            credit = re.sub(r"\s+", " ", credit).strip()
+            break
+    # drop redundant inline labels copied from the page markup itself, and
+    # fix the " ," / " -" spacing artifacts left behind by tag stripping
+    credit = re.sub(
+        r"^(?:Image\s*)?Credit(?:\s*(?:&|&amp;|and)\s*Copyright)?\s*[:\-]\s*",
+        "", credit, flags=re.I).strip(" -\u2013\t")
+    credit = re.sub(r"\s+([,;])\s*", r"\1 ", credit)
+    credit = re.sub(r"\s+-\s+", " – ", credit)
+    credit = " ".join(credit.split())
 
     # --- image candidates ---
     ogi = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]*)"', txt)
