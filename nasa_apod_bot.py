@@ -481,6 +481,10 @@ def validate_apod(apod: dict) -> None:
 # --------------------------------------------------------------------------- #
 
 APOD_WEB_HOME = "https://science.nasa.gov/apod/"
+# RSS carries the newest daily entry even when the /apod/ homepage HTML is
+# stale (2026-10-06: the homepage kept listing Oct-5 while the feed already
+# had Oct-6 — that mismatch silently skipped a whole day's post).
+APOD_WEB_FEED = "https://science.nasa.gov/feed/apod-basic/"
 WEB_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -531,21 +535,12 @@ def _is_apod_article(resp) -> bool:
     return "APOD:" in title and "Page not found" not in title
 
 
-def scrape_apod_web() -> dict | None:
-    """
-    Recover the REAL current APOD from science.nasa.gov when the API serves
-    its placeholder record. The website always carries the genuine daily
-    entry as an "image-article" page. Returns an API-shaped dict, or None.
-    """
-    session = requests.Session()
-    home = _web_get(session, APOD_WEB_HOME)
-    if home is None:
-        return None
-    # daily APOD entries look like /image-article/apod-2026-october-1-<slug>/
+def _latest_apod_entries_home(home_text: str) -> list:
+    """(date, href) pairs parsed from the /apod/ homepage HTML."""
     entries = []
     for href in re.findall(
             r'href="(https?://science\.nasa\.gov/(?:image-article/)+apod-[^"]+)"',
-            home.text):
+            home_text):
         m = re.search(r"/apod-(\d{4})-([a-z]+)-(\d{1,2})(?:-|/|$)", href)
         if not m:
             continue
@@ -555,8 +550,57 @@ def scrape_apod_web() -> dict | None:
         date = f"{m.group(1)}-{month:02d}-{int(m.group(3)):02d}"
         if (date, href) not in entries:
             entries.append((date, href))
+    return entries
+
+
+def _latest_apod_entries_feed(session) -> list:
+    """(date, href) pairs parsed from the apod-basic RSS feed (newest first).
+
+    The feed is the authoritative "what is the current APOD" source — the
+    homepage can lag a whole day behind. Falls back to [] on any failure.
+    """
+    feed = _web_get(session, APOD_WEB_FEED)
+    if feed is None:
+        return []
+    entries = []
+    for item in re.findall(r"<item>(.*?)</item>", feed.text, re.S):
+        link = re.search(r"<link>\s*(.*?)\s*</link>", item)
+        if not link:
+            continue
+        href = html.unescape(link.group(1)).strip()
+        m = re.search(r"/apod-(\d{4})-([a-z]+)-(\d{1,2})(?:-|/|$)", href)
+        if not m:
+            continue
+        month = WEB_MONTHS.get(m.group(2).lower())
+        if not month:
+            continue
+        date = f"{m.group(1)}-{month:02d}-{int(m.group(3)):02d}"
+        if (date, href) not in entries:
+            entries.append((date, href))
+    return entries
+
+
+def scrape_apod_web() -> dict | None:
+    """
+    Recover the REAL current APOD from science.nasa.gov when the API serves
+    its placeholder record. The website always carries the genuine daily
+    entry as an "image-article" page. Returns an API-shaped dict, or None.
+    """
+    session = requests.Session()
+    # Discovery: RSS first (authoritative + fresh), homepage as fallback.
+    entries = _latest_apod_entries_feed(session)
+    if entries:
+        log.info("APOD feed discovery: newest entry %s", entries[0][0])
+    else:
+        home = _web_get(session, APOD_WEB_HOME)
+        if home is None:
+            return None
+        entries = _latest_apod_entries_home(home.text)
+        if entries:
+            log.info("APOD homepage discovery: newest entry %s", entries[0][0])
     if not entries:
-        log.warning("APOD homepage: no daily article links found")
+        log.warning("APOD web discovery: no daily article links found "
+                    "(feed and homepage both empty)")
         return None
     date, href = max(entries, key=lambda e: e[0])
     article = _web_get(session, href, validate=_is_apod_article)
@@ -613,6 +657,24 @@ def scrape_apod_web() -> dict | None:
     credit = re.sub(r"\s+-\s+", " – ", credit)
     credit = " ".join(credit.split())
 
+    # --- animated GIF detection (video-ish days publish a .gif as media) ---
+    # The article embeds the original animation, e.g.
+    #   <a href="https://assets.science.nasa.gov/content/dam/.../x.gif?w=512...">
+    # while og:image is only a STATIC jpeg poster. To honor "post the
+    # original media", the GIF must win over the poster.
+    gif_url = ""
+    for pat in (
+            # the media <a> wrapper around the <img>
+            r'<a[^>]+href="(https?://assets\.science\.nasa\.gov/[^"]+?\.gif)\??[^"]*"',
+            # an <img> whose src is a nasa CDN gif
+            r'<img[^>]+src="(https?://assets\.science\.nasa\.gov/[^"]+?\.gif)\??[^"]*"',
+            # any other hosted .gif in the article body
+            r'(https?://assets\.science\.nasa\.gov/[^"\s]+?\.gif)\b'):
+        m = re.search(pat, txt)
+        if m:
+            gif_url = html.unescape(m.group(1))
+            break
+
     # --- image candidates ---
     ogi = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]*)"', txt)
     og_image = html.unescape(ogi.group(1)) if ogi else ""
@@ -642,6 +704,9 @@ def scrape_apod_web() -> dict | None:
             break
 
     candidates = []
+    # the animated original (if any) always comes FIRST — it is the real media
+    if gif_url and gif_url not in candidates:
+        candidates.append(gif_url)
     for u in (dam_original, dyn, og_image):
         if not u or u in candidates:
             continue
@@ -652,7 +717,9 @@ def scrape_apod_web() -> dict | None:
         log.warning("APOD article %s: no usable image URL found", date)
         return None
 
-    log.info("Web recovery: %s — %s (credit: %s)", date, title, credit or "?")
+    log.info("Web recovery: %s — %s (credit: %s%s)",
+             date, title, credit or "?",
+             "; animated GIF" if gif_url else "")
     return {
         "date": date,
         "title": title.strip(),
@@ -664,6 +731,7 @@ def scrape_apod_web() -> dict | None:
         "service_version": "web-recovery",
         "extra_image_urls": candidates[1:],
         "source": "science.nasa.gov",
+        "animated": bool(gif_url),
     }
 
 
@@ -760,8 +828,21 @@ def shrink_for_telegram(path: Path):
     PHOTO_INVALID_DIMENSIONS). We cap the longest side at 4000 px — far
     above Telegram's own display resolution — and step quality down until
     the file fits ~9.7 MB.
+
+    ANIMATED GIFs are exempt: re-encoding would flatten them to a static
+    JPEG frame. They are sent via sendAnimation (limit 50 MB) instead, so
+    they only need a size check here.
     """
     import io
+
+    if path.suffix.lower() == ".gif":
+        # 45 MB safety margin under sendAnimation's 50 MB limit
+        if path.stat().st_size <= 45 * 1024 * 1024:
+            return path
+        log.warning("GIF too large for sendAnimation (%.1f MB) — cannot "
+                    "re-encode without killing the animation; trying the "
+                    "next candidate", path.stat().st_size / 1e6)
+        return None
 
     size_limit = 10 * 1024 * 1024 - 300 * 1024   # 9.7 MB with safety margin
     max_side = 4000
@@ -952,10 +1033,27 @@ def send_message(text: str) -> None:
 
 
 def send_media(path: Path, caption: str) -> None:
-    """Send a photo/video with caption; documents as a fallback format."""
-    is_video = path.suffix.lower() == ".mp4"
-    method, field = ("sendVideo", "video") if is_video else ("sendPhoto", "photo")
-    mime = mimetypes.guess_type(str(path))[0] or ("video/mp4" if is_video else "image/jpeg")
+    """Send a photo/animation/video with caption; document as a fallback.
+
+    Routing by file type:
+      .mp4         -> sendVideo   (the real video, yt-dlp download)
+      .gif         -> sendAnimation (Telegram converts it to an inline MP4
+                      animation — the motion of the original is preserved;
+                      sending it as a photo would freeze the first frame)
+      anything else-> sendPhoto
+    Every non-video path falls back to sendDocument if the primary method
+    rejects the file.
+    """
+    suffix = path.suffix.lower()
+    is_video = suffix == ".mp4"
+    is_gif = suffix == ".gif"
+    if is_video:
+        method, field, mime = "sendVideo", "video", "video/mp4"
+    elif is_gif:
+        method, field, mime = "sendAnimation", "animation", "image/gif"
+    else:
+        method, field, mime = "sendPhoto", "photo", \
+            mimetypes.guess_type(str(path))[0] or "image/jpeg"
     try:
         with open(path, "rb") as fh:
             payload = tg_api(
@@ -970,7 +1068,25 @@ def send_media(path: Path, caption: str) -> None:
     except Exception as exc:
         if is_video:
             raise
-        log.warning("sendPhoto failed (%s) — retrying as document", exc)
+        if is_gif:
+            # a GIF can still go out as a (static) photo — better a frozen
+            # frame than no media at all; document is the last resort
+            log.warning("sendAnimation failed (%s) — retrying as photo", exc)
+            try:
+                with open(path, "rb") as fh:
+                    payload = tg_api(
+                        "sendPhoto",
+                        {"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                        files={"photo": (path.name, fh, "image/gif")},
+                        timeout=UPLOAD_TIMEOUT,
+                    )
+                    msg_id = (payload.get("result") or {}).get("message_id")
+                    log.info("Telegram media message sent (id=%s, sendPhoto)",
+                             msg_id)
+                    return
+            except Exception as exc2:
+                exc = exc2
+        log.warning("media send failed (%s) — retrying as document", exc)
     with open(path, "rb") as fh:
         payload = tg_api(
             "sendDocument",
