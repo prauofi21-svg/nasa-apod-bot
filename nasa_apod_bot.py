@@ -395,9 +395,11 @@ def split_text(text: str, limit: int = MAX_MESSAGE_LEN) -> list:
 #  NASA API                                                                    #
 # --------------------------------------------------------------------------- #
 
-def fetch_apod() -> dict:
+def fetch_apod(date: str = None) -> dict:
     """
-    Fetch the latest available APOD.
+    Fetch the latest available APOD — or one specific date when `date` is
+    given (used by the guardian to backfill a missed day; no walkback then,
+    because backfilling MUST publish exactly that date, not a substitute).
 
     NASA's API returns HTTP 500 for the "today" query when the current day's
     entry has not been published yet (typically in the hours before the new
@@ -411,7 +413,10 @@ def fetch_apod() -> dict:
     """
     api_key = NASA_API_KEY or "DEMO_KEY"
     today = datetime.now(timezone.utc).date()
-    candidates = [None] + [(today - timedelta(days=n)).isoformat() for n in range(1, 4)]
+    if date:
+        candidates = [date.strip()]
+    else:
+        candidates = [None] + [(today - timedelta(days=n)).isoformat() for n in range(1, 4)]
     last_error = None
     scrape_budget = 3   # web-recovery attempts allowed across the whole fetch
     for cycle in range(1, 4):
@@ -1145,17 +1150,39 @@ def load_state() -> dict:
         return {}
 
 
+APOD_STATE_HISTORY = 30   # days kept in posted_dates
+
+
 def save_state(apod: dict) -> None:
+    """
+    Record the posted APOD. `date/title` always describe the NEWEST posted
+    day (so the daily runs' latest-check keeps working), while the rolling
+    `posted_dates` list lets the guardian verify — and backfill — any of the
+    last 30 days without ever double-posting one.
+    """
+    state = load_state()
+    dates = [d for d in state.get("posted_dates", []) if isinstance(d, str)]
+    if state.get("date") and state["date"] not in dates:
+        dates.append(state["date"])          # one-time migration of old states
+    if apod.get("date") and apod["date"] not in dates:
+        dates.append(apod["date"])
+    dates = sorted(set(dates))[-APOD_STATE_HISTORY:]
+    newest = state.get("date") or ""
+    out = {"posted_dates": dates}
+    if not apod.get("date") or apod["date"] >= newest:
+        out.update({
+            "date": apod.get("date") or newest,
+            "title": apod.get("title") or state.get("title"),
+            "posted_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+    else:                                     # backfill of an older day
+        out.update({
+            "date": newest,
+            "title": state.get("title"),
+            "posted_at_utc": state.get("posted_at_utc"),
+        })
     Path(STATE_FILE).write_text(
-        json.dumps(
-            {
-                "date": apod.get("date"),
-                "title": apod.get("title"),
-                "posted_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
+        json.dumps(out, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -1220,6 +1247,9 @@ def main() -> int:
                         help="post even if this APOD was already posted")
     parser.add_argument("--detect-chat", action="store_true",
                         help="list chat IDs visible to the bot, then exit")
+    parser.add_argument("--date", metavar="YYYY-MM-DD", default=None,
+                        help="post that specific APOD (guardian backfill for a "
+                             "missed day); duplicate protection still applies")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1245,14 +1275,17 @@ def main() -> int:
             log.error("Missing environment variables: %s", ", ".join(missing))
             return 2
 
-    apod = fetch_apod()
+    apod = fetch_apod(args.date)
     validate_apod(apod)
     log.info("APOD fetched: %s — %s", apod.get("date"), apod.get("title"))
 
     force = args.force or os.environ.get("FORCE_POST", "").strip().lower() in ("1", "true", "yes", "on")
     if not args.dry_run and not force:
         state = load_state()
-        if state.get("date") == apod.get("date"):
+        posted_dates = set(state.get("posted_dates", []))
+        if state.get("date"):
+            posted_dates.add(state["date"])
+        if apod.get("date") in posted_dates:
             log.info("APOD for %s was already posted — nothing to do.", apod.get("date"))
             return 0
 
