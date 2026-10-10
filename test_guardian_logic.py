@@ -309,6 +309,23 @@ r = g.phase_apod(TODAY, FakeView([mkmsg(191, D10, APOD_TEXT_10, photo=True)]), d
 check("yesterday missing: would-run backfill",
       any("2026-10-09" in h and "would run" in h for h in r.healed), r.healed)
 
+# yesterday missing + preview UNAVAILABLE -> never backfill blindly (no dups)
+reset_apod_state(dates=("2026-10-10",), current="2026-10-10")
+NOVIEW_A = FakeView([mkmsg(191, D10, APOD_TEXT_10, photo=True)])
+NOVIEW_A.available = False
+r = g.phase_apod(TODAY, NOVIEW_A, dry=True)
+check("no-preview: no blind backfill of older days",
+      r.ok and any("no channel evidence" in n for n in r.notes)
+      and not any("2026-10-09" in h for h in r.healed), (r.problems, r.notes, r.healed))
+
+# today missing + preview UNAVAILABLE + state lacks -> bot still runs (like slots)
+reset_apod_state()
+NOVIEW_T = FakeView([])
+NOVIEW_T.available = False
+r = g.phase_apod(TODAY, NOVIEW_T, dry=True)
+check("no-preview: today still top-up-able",
+      any("2026-10-10" in h and "would run" in h for h in r.healed), r.healed)
+
 # NASA API unreachable -> checks still proceed (never skipped)
 reset_apod_state(dates=("2026-10-09", "2026-10-10"), current="2026-10-10")
 g.fetch_apod_meta = mock_meta({"2026-10-10": (None, "unreachable"),
