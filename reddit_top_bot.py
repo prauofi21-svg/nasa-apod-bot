@@ -16,10 +16,14 @@ today, so the backup cron run only tops up what is missing instead of
 duplicating posts.
 
 Reddit data sources are tried in order (datacenter IPs are often blocked by
-Reddit's public JSON API, so a mirror is the reliable fallback):
+Reddit's public JSON API, so mirrors are the reliable fallback):
   1. the public JSON endpoints (www/old/api.reddit.com) — live scores
   2. the official OAuth API, if REDDIT_CLIENT_ID/SECRET are set — live scores
   3. the Arctic-Shift archive mirror (no auth) — scores updated periodically
+  4. the PullPush archive mirror (no auth) — same staleness trade-off
+The whole chain is retried a few times inside one run, and the workflow
+itself runs several times a day (the daily quota makes retries no-ops once
+the day's posts are out).
 
 De-duplication: STATE_FILE remembers recently posted Reddit post ids, so a
 post is never published twice.
@@ -44,6 +48,10 @@ Optional environment variables:
     STATE_FILE          default state_reddit.json
     FORCE_POST          "true" — same as --force
     REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET — official OAuth API (optional)
+    FETCH_ROUNDS        default 3 — how many times the whole source chain is
+                        retried (with FETCH_ROUND_WAIT spacing) before giving
+                        up; mirrors occasionally suffer short outages
+    FETCH_ROUND_WAIT    default 240 seconds between retry rounds
 """
 
 from __future__ import annotations
@@ -89,6 +97,11 @@ MIRROR_HOURS = int(os.environ.get("MIRROR_HOURS", "54"))
 STATE_FILE = os.environ.get("STATE_FILE", "state_reddit.json").strip()
 CHANNEL_SIGNATURE = os.environ.get("CHANNEL_SIGNATURE", "@daily_sciences").strip()
 
+# Resilience: the whole source chain is retried this many times, spaced by
+# FETCH_ROUND_WAIT seconds, so a short mirror outage does not ruin the day.
+FETCH_ROUNDS = max(1, int(os.environ.get("FETCH_ROUNDS", "3")))
+FETCH_ROUND_WAIT = max(0, int(os.environ.get("FETCH_ROUND_WAIT", "240")))
+
 REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "").strip()
 REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
 
@@ -104,6 +117,8 @@ REDDIT_HOSTS = [
 ]
 
 ARCTIC_SHIFT = "https://arctic-shift.photon-reddit.com/api/posts/search"
+
+PULLPUSH = "https://api.pullpush.io/reddit/search/submission/"
 
 MAX_IMAGE_SIZE = 48 * 1024 * 1024
 _IMAGE_EXT_RE = re.compile(r"\.(jpe?g|png|webp|gif)(?:[?#]|$)", re.I)
@@ -213,24 +228,87 @@ def fetch_via_arctic_shift() -> list:
     return posts
 
 
+def fetch_via_pullpush() -> list:
+    """
+    Second fallback: PullPush (the Pushshift successor API, no auth).
+
+    Same idea as Arctic-Shift: submissions from the last MIRROR_HOURS with
+    periodically refreshed scores. The endpoint is aggressively rate-limited
+    per IP, so requests are paced and 429s are retried with backoff. PullPush
+    expects `after` as an epoch-seconds timestamp (not the "54h" form).
+    """
+    after = int(time.time()) - MIRROR_HOURS * 3600
+    posts = []
+    for sub in SUBREDDITS:
+        data = []
+        for attempt in range(1, 4):  # up to 3 tries per subreddit
+            try:
+                resp = requests.get(
+                    PULLPUSH,
+                    params={"subreddit": sub, "after": str(after), "size": "100",
+                            "sort": "desc", "sort_type": "created_utc"},
+                    timeout=(20, 90),
+                )
+                if resp.status_code == 200:
+                    data = resp.json().get("data") or []
+                    break
+                if resp.status_code == 429:
+                    wait = 15 * attempt
+                    log.info("PullPush 429 for r/%s (try %d) — waiting %ds",
+                             sub, attempt, wait)
+                    time.sleep(wait)
+                    continue
+                log.warning("PullPush returned HTTP %s for r/%s", resp.status_code, sub)
+                break
+            except (requests.RequestException, ValueError) as exc:
+                log.warning("PullPush failed for r/%s: %s", sub, exc)
+                break
+        if data:
+            posts.extend(data)
+            log.info("PullPush r/%s: %d posts", sub, len(data))
+        time.sleep(6)  # pacing: pullpush rate-limits per IP
+    if not posts:
+        log.warning("PullPush returned no posts at all")
+    return posts
+
+
 def fetch_reddit_posts() -> list:
-    """Fetch posts from the first source that works (best quality first)."""
-    for fetcher, label in (
+    """
+    Fetch posts from the first source that works (best quality first).
+
+    The whole chain is retried FETCH_ROUNDS times, spaced FETCH_ROUND_WAIT
+    seconds apart, so a transient mirror outage (5xx/timeout blips) does not
+    lose the day — combined with the extra scheduled runs this makes the
+    pipeline resilient even during multi-hour mirror outages.
+    """
+    sources = (
         (fetch_via_public_json, "public JSON"),
         (fetch_via_oauth, "OAuth"),
         (fetch_via_arctic_shift, "Arctic-Shift mirror"),
-    ):
-        if fetcher is fetch_via_oauth and not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
-            continue
-        posts = fetcher()
-        if posts:
-            log.info("Reddit data source: %s", label)
-            return posts
+        (fetch_via_pullpush, "PullPush mirror"),
+    )
+    for rnd in range(1, FETCH_ROUNDS + 1):
+        for fetcher, label in sources:
+            if fetcher is fetch_via_oauth and not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
+                continue
+            try:
+                posts = fetcher()
+            except Exception as exc:  # defensive: never let one source kill the chain
+                log.warning("Source %s raised: %s", label, exc)
+                posts = []
+            if posts:
+                log.info("Reddit data source: %s (round %d/%d)", label, rnd, FETCH_ROUNDS)
+                return posts
+        if rnd < FETCH_ROUNDS:
+            log.warning("All Reddit sources failed (round %d/%d) — retrying in %ds",
+                        rnd, FETCH_ROUNDS, FETCH_ROUND_WAIT)
+            time.sleep(FETCH_ROUND_WAIT)
     raise RuntimeError(
-        "All Reddit data sources failed. Public JSON endpoints are blocked "
-        "from datacenter IPs; consider setting REDDIT_CLIENT_ID and "
-        "REDDIT_CLIENT_SECRET (free app from reddit.com/prefs/apps) for the "
-        "official OAuth API, or try again later if the mirror is down."
+        "All Reddit data sources failed after %d rounds. Public JSON endpoints "
+        "are blocked from datacenter IPs; mirrors may be down. Consider setting "
+        "REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET (free app from "
+        "reddit.com/prefs/apps) for the official OAuth API, or try again later "
+        "if the mirrors recover." % FETCH_ROUNDS
     )
 
 
@@ -525,6 +603,20 @@ def reddit_report() -> str:
             lines.append(f"arctic-shift: HTTP {resp.status_code} — ERROR")
     except Exception as exc:
         lines.append(f"arctic-shift: {exc}")
+    try:
+        resp = requests.get(PULLPUSH,
+                            params={"subreddit": SUBREDDITS[0],
+                                    "after": str(int(time.time()) - 24 * 3600),
+                                    "size": "5", "sort": "desc",
+                                    "sort_type": "created_utc"},
+                            timeout=(15, 60))
+        if resp.status_code == 200:
+            n = len(resp.json().get("data") or [])
+            lines.append(f"pullpush ({SUBREDDITS[0]}): HTTP 200, posts={n} — OK")
+        else:
+            lines.append(f"pullpush: HTTP {resp.status_code} — ERROR")
+    except Exception as exc:
+        lines.append(f"pullpush: {exc}")
     lines.append(
         "OAuth credentials: " + ("present" if REDDIT_CLIENT_ID else "not set (optional)")
     )
