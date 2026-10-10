@@ -1,0 +1,109 @@
+name: Channel Guardian
+
+# The unified safety net for BOTH pipelines (NASA APOD + Reddit top 5).
+# It does not trust the state files alone: it reads the channel's real
+# content through the public preview (t.me/s/<channel>) and self-heals
+# every gap it can — then verifies again:
+#   * missing post  -> runs the responsible bot (state-protected, so a
+#                      healthy channel is never re-posted)
+#   * duplicate     -> deletes the later copy (strong match only) and
+#                      adjusts the daily quota 1:1
+#   * broken APOD   -> deletes the text-only post, unmarks the state and
+#                      re-posts it with media
+#   * unfixable     -> the job FAILS, so GitHub emails the repo owner
+#
+# Schedule (all times UTC / Tehran = UTC+3:30):
+#   09:55  morning  — verifies/backfills yesterday's + today's APOD after
+#                    the 09:40 safety net (Reddit quota not final yet, so
+#                    its check is skipped by design)
+#   22:10  evening  — full check: today's Reddit 5/5 + duplicates window
+#                    wide + today's APOD (after ALL slots of both pipelines)
+#   23:05  late     — second evening chance in case the 22:10 slot itself
+#                    was dropped by GitHub (no-op when healthy, ~2 min)
+#
+# All three channel workflows share the `channel-pipelines` concurrency
+# group, so a guardian heal can never interleave with another run.
+
+on:
+  schedule:
+    - cron: "55 9 * * *"    # morning  (14:25 Tehran)
+    - cron: "10 22 * * *"   # evening  (01:40 Tehran)
+    - cron: "5 23 * * *"    # late     (02:35 Tehran)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Verify only — no deletes, no bot runs, no state writes"
+        type: boolean
+        default: false
+      skip_reddit:
+        description: "APOD-only check"
+        type: boolean
+        default: false
+      force_reddit_check:
+        description: "Check the Reddit quota even before the evening slots end"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # to persist healed state files
+
+concurrency:
+  group: channel-pipelines
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Verify and heal the channel
+    runs-on: ubuntu-latest
+    timeout-minutes: 75   # worst case: reddit heal (≤40m) + apod heal (≤25m)
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the channel guardian
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NASA_API_KEY: ${{ secrets.NASA_API_KEY }}
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}      # used by the bots on heal
+          SUBREDDITS: science+space+astronomy
+          POSTS_COUNT: "5"
+          STATE_FILE: state.json
+          REDDIT_STATE_FILE: state_reddit.json
+          # ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}  # optional TG alerts
+        run: |
+          # Start from the NEWEST pushed state (same race fix as the other
+          # workflows) — heals must always build on the latest state.
+          git fetch origin main
+          git reset --hard origin/main
+          # NOTE: GitHub runs bash with -e; each [ ] test needs "|| true"
+          # or a failed flag check would abort the step.
+          ARGS=""
+          [ "${{ inputs.dry_run }}" = "true" ] && ARGS="$ARGS --dry-run" || true
+          [ "${{ inputs.skip_reddit }}" = "true" ] && ARGS="$ARGS --skip-reddit" || true
+          [ "${{ inputs.force_reddit_check }}" = "true" ] && ARGS="$ARGS --force-reddit-check" || true
+          echo "guardian args:${ARGS:- (none)}"
+          python channel_guardian.py $ARGS
+
+      - name: Save healed state files
+        if: always() && !inputs.dry_run
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json state_reddit.json || true
+          if git diff --cached --quiet; then
+            echo "state files unchanged — nothing to commit."
+          else
+            git commit -m "chore: guardian state update [skip ci]"
+            git pull --rebase origin main
+            git push
+          fi
