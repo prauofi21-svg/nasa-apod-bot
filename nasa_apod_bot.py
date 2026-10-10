@@ -200,7 +200,10 @@ def strip_apod_meta(text: str) -> str:
     text = text or ""
     for sub in APOD_META_SUBS:
         text = sub.sub(" ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    # collapse runs of spaces/tabs (but keep paragraph newlines intact —
+    # normalize_explanation relies on them surviving meta stripping)
+    text = re.sub(r"[^\S\n]+", " ", text).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
     if not APOD_META_RE.search(text):
         return text
     sentences = re.split(r"(?<=[.!?])\s+", text)
@@ -213,8 +216,11 @@ def normalize_explanation(text: str) -> str:
     Tidy NASA's explanation text: drop website meta notes, then turn NASA's
     space-run paragraph separators into real paragraph breaks.
     """
-    text = strip_apod_meta((text or "").strip())
-    text = re.sub(r"[ \t]{3,}", "\n\n", text)   # 3+ spaces -> paragraph break
+    text = (text or "").strip()
+    # 3+ spaces mark NASA's paragraph separators — convert BEFORE meta
+    # stripping, which collapses whitespace runs.
+    text = re.sub(r"[ \t]{3,}", "\n\n", text)
+    text = strip_apod_meta(text)
     text = re.sub(r"[ \t]{2,}", " ", text)      # leftover double spaces
     text = re.sub(r"\n{3,}", "\n\n", text)      # too many blank lines
     return text.strip()
