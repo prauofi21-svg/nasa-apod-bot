@@ -69,7 +69,14 @@ jobs:
           GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
           STATE_FILE: state.json
           FORCE_POST: ${{ inputs.force || 'false' }}
-        run: python nasa_apod_bot.py ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          # Start from the NEWEST pushed state: a queued run's checkout can
+          # predate another run's state push (fixed SHA at run creation), and
+          # that race could cause duplicate posts. Concurrency serializes the
+          # runs, so at this point no other run is mid-flight.
+          git fetch origin main
+          git reset --hard origin/main
+          python nasa_apod_bot.py ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: Save state file (duplicate protection + keeps repo active)
         if: always()
@@ -81,5 +88,6 @@ jobs:
             echo "state.json unchanged — nothing to commit."
           else
             git commit -m "chore: update APOD state [skip ci]"
+            git pull --rebase origin main
             git push
           fi
