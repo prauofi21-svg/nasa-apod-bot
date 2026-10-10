@@ -33,8 +33,12 @@ on:
 permissions:
   contents: write   # required to save state_reddit.json (duplicate protection)
 
+# ONE shared concurrency group for ALL channel pipelines (NASA, Reddit,
+# Guardian): GitHub keeps at most one running + one pending run per group,
+# so no two runs can ever interleave their state read→post→push cycles.
+# That race once caused duplicate posts; this group makes it impossible.
 concurrency:
-  group: reddit-top-daily
+  group: channel-pipelines
   cancel-in-progress: false
 
 jobs:
