@@ -73,6 +73,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # The channel preview (t.me/s/…) needs the public USERNAME — the
+          # chat-id secret may be numeric, which would break the preview URL.
+          CHANNEL_USERNAME: daily_sciences
           NASA_API_KEY: ${{ secrets.NASA_API_KEY }}
           GROK_API_KEY: ${{ secrets.GROK_API_KEY }}      # used by the bots on heal
           SUBREDDITS: science+space+astronomy
