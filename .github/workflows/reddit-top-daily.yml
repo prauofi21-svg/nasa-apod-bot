@@ -65,7 +65,14 @@ jobs:
           MIN_SCORE: "50"
           STATE_FILE: state_reddit.json
           FORCE_POST: ${{ inputs.force || 'false' }}
-        run: python reddit_top_bot.py ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          # Start from the NEWEST pushed state: a queued run's checkout can
+          # predate another run's state push (fixed SHA at run creation), and
+          # that race once caused duplicate posts. Concurrency serializes the
+          # runs, so at this point no other run is mid-flight.
+          git fetch origin main
+          git reset --hard origin/main
+          python reddit_top_bot.py ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: Save state file (duplicate protection + keeps repo active)
         if: always() && !inputs.dry_run
@@ -77,5 +84,6 @@ jobs:
             echo "state_reddit.json unchanged — nothing to commit."
           else
             git commit -m "chore: update Reddit state [skip ci]"
+            git pull --rebase origin main
             git push
           fi
