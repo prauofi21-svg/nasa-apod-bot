@@ -337,7 +337,7 @@ def fetch_via_rss() -> list:
     posts = []
     for sub in SUBREDDITS:
         data = []
-        for attempt in range(1, 3):  # one retry on rate-limit
+        for attempt in range(1, 4):  # up to 3 tries on rate-limit
             try:
                 resp = requests.get(
                     f"https://www.reddit.com/r/{sub}/top.rss",
@@ -350,8 +350,9 @@ def fetch_via_rss() -> list:
                     data = _parse_reddit_atom(resp.text, sub)
                     break
                 if resp.status_code == 429:
-                    log.info("RSS 429 for r/%s (try %d) — waiting 10s", sub, attempt)
-                    time.sleep(10)
+                    wait = 20 * attempt
+                    log.info("RSS 429 for r/%s (try %d) — waiting %ds", sub, attempt, wait)
+                    time.sleep(wait)
                     continue
                 log.warning("RSS returned HTTP %s for r/%s", resp.status_code, sub)
                 break
@@ -361,7 +362,7 @@ def fetch_via_rss() -> list:
         if data:
             posts.extend(data)
             log.info("RSS r/%s: %d posts", sub, len(data))
-        time.sleep(3)  # gentle pacing between feeds
+        time.sleep(10)  # gentle pacing: reddit rate-limits feeds per IP
     if not posts:
         log.warning("RSS returned no posts at all")
     return posts
