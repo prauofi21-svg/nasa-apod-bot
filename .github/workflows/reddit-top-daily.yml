@@ -2,14 +2,23 @@ name: Reddit Top Daily Post
 
 # Posts the day's top Reddit science posts (with Persian translations) to the
 # Telegram channel once a day.
-#   - Main run:   10:00 UTC = 13:30 (Tehran)
-#   - Backup run: 11:30 UTC = 15:00 (Tehran) — no-op if the main run already
-#     posted, because state_reddit.json prevents duplicate posts.
+#   - Main run: 10:00 UTC = 13:30 (Tehran)
+#   - Retry runs: 11:30, 13:00, 14:30, 16:00, 17:30 UTC — no-ops once the
+#     day's posts are out, because state_reddit.json (daily quota + posted
+#     ids) prevents duplicate posts. The retries exist so a mirror outage
+#     (e.g. Arctic-Shift 522) can no longer ruin a whole day: whenever any
+#     source recovers, the missing posts are published on the next run.
+#   - Inside one run the source chain itself is also retried (3 rounds,
+#     4 minutes apart) to ride out short blips.
 
 on:
   schedule:
-    - cron: "0 10 * * *"    # main run   (13:30 Tehran)
-    - cron: "30 11 * * *"   # backup run (15:00 Tehran)
+    - cron: "0 10 * * *"    # main run    (13:30 Tehran)
+    - cron: "30 11 * * *"   # retry run 1 (15:00 Tehran)
+    - cron: "0 13 * * *"    # retry run 2 (16:30 Tehran)
+    - cron: "30 14 * * *"   # retry run 3 (18:00 Tehran)
+    - cron: "0 16 * * *"    # retry run 4 (19:30 Tehran)
+    - cron: "30 17 * * *"   # retry run 5 (21:00 Tehran)
   workflow_dispatch:
     inputs:
       force:
@@ -32,7 +41,7 @@ jobs:
   post:
     name: Post Reddit Top 5 to Telegram
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
