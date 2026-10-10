@@ -21,6 +21,8 @@ Reddit's public JSON API, so mirrors are the reliable fallback):
   2. the official OAuth API, if REDDIT_CLIENT_ID/SECRET are set — live scores
   3. the Arctic-Shift archive mirror (no auth) — scores updated periodically
   4. the PullPush archive mirror (no auth) — same staleness trade-off
+  5. Reddit's RSS/Atom top-of-day feeds (no auth) — live ranking but no
+     score/comment numbers (stats line suppressed for such posts)
 The whole chain is retried a few times inside one run, and the workflow
 itself runs several times a day (the daily quota makes retries no-ops once
 the day's posts are out).
@@ -66,6 +68,7 @@ import re
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -119,6 +122,13 @@ REDDIT_HOSTS = [
 ARCTIC_SHIFT = "https://arctic-shift.photon-reddit.com/api/posts/search"
 
 PULLPUSH = "https://api.pullpush.io/reddit/search/submission/"
+
+ATOM = "{http://www.w3.org/2005/Atom}"
+_RSS_IMG_RE = re.compile(r'<img[^>]+src="([^"]+)"', re.I)
+# A browser-like UA: Reddit's edge blocks bot-style UAs harder on datacenter IPs;
+# RSS fetches are low-volume (3 feeds/day) and read-only.
+RSS_UA = ("Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 "
+          "Firefox/130.0")
 
 MAX_IMAGE_SIZE = 48 * 1024 * 1024
 _IMAGE_EXT_RE = re.compile(r"\.(jpe?g|png|webp|gif)(?:[?#]|$)", re.I)
@@ -272,6 +282,91 @@ def fetch_via_pullpush() -> list:
     return posts
 
 
+def _parse_reddit_atom(xml_text: str, sub: str) -> list:
+    """Normalize Reddit's Atom top-feed into reddit-children-like dicts."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    posts = []
+    for idx, entry in enumerate(root.findall(f"{ATOM}entry")):
+        pid = (entry.findtext(f"{ATOM}id") or "").strip()
+        if pid.startswith("t3_"):
+            pid = pid[3:]
+        title = (entry.findtext(f"{ATOM}title") or "").strip()
+        if not pid or not title:
+            continue
+        content = entry.findtext(f"{ATOM}content") or ""
+        image_url = None
+        m = _RSS_IMG_RE.search(content)
+        if m:
+            url = html_mod.unescape(m.group(1))
+            if url.startswith("http"):
+                image_url = url
+        post = {
+            "id": pid,
+            "title": title,
+            "subreddit": sub,
+            # feed position == score rank; used for ranking only — the stats
+            # line is suppressed for RSS posts (real numbers are unknown,
+            # and fake numbers must never reach the channel)
+            "score": 100000 - idx * 100,
+            "num_comments": 0,
+            "selftext": "",
+            "stickied": False,
+            "over_18": False,
+            "no_stats": True,
+        }
+        if image_url:
+            post["preview"] = {"images": [{"source": {"url": image_url, "width": 640}}]}
+        posts.append(post)
+    return posts
+
+
+def fetch_via_rss() -> list:
+    """
+    Last-resort source: Reddit's RSS/Atom top-of-day feeds (no auth).
+
+    The JSON API blocks datacenter IPs (403), but the .rss endpoints are
+    currently served — and they carry the LIVE top-of-day ranking, with no
+    mirror lag. The feed lacks score/comment counts and selftext, so posts
+    from this source are published without the stats line and their summary
+    is based on the title alone. Used only when every mirror is down, so a
+    mirror outage can no longer leave the channel without its daily posts.
+    """
+    posts = []
+    for sub in SUBREDDITS:
+        data = []
+        for attempt in range(1, 3):  # one retry on rate-limit
+            try:
+                resp = requests.get(
+                    f"https://www.reddit.com/r/{sub}/top.rss",
+                    params={"t": "day"},
+                    headers={"User-Agent": RSS_UA,
+                             "Accept": "application/atom+xml, application/xml"},
+                    timeout=(20, 60),
+                )
+                if resp.status_code == 200:
+                    data = _parse_reddit_atom(resp.text, sub)
+                    break
+                if resp.status_code == 429:
+                    log.info("RSS 429 for r/%s (try %d) — waiting 10s", sub, attempt)
+                    time.sleep(10)
+                    continue
+                log.warning("RSS returned HTTP %s for r/%s", resp.status_code, sub)
+                break
+            except (requests.RequestException, ValueError) as exc:
+                log.warning("RSS failed for r/%s: %s", sub, exc)
+                break
+        if data:
+            posts.extend(data)
+            log.info("RSS r/%s: %d posts", sub, len(data))
+        time.sleep(3)  # gentle pacing between feeds
+    if not posts:
+        log.warning("RSS returned no posts at all")
+    return posts
+
+
 def fetch_reddit_posts() -> list:
     """
     Fetch posts from the first source that works (best quality first).
@@ -286,6 +381,7 @@ def fetch_reddit_posts() -> list:
         (fetch_via_oauth, "OAuth"),
         (fetch_via_arctic_shift, "Arctic-Shift mirror"),
         (fetch_via_pullpush, "PullPush mirror"),
+        (fetch_via_rss, "Reddit RSS feed"),
     )
     for rnd in range(1, FETCH_ROUNDS + 1):
         for fetcher, label in sources:
@@ -326,8 +422,9 @@ def pick_posts(posts: list, posted_ids: set) -> list:
             continue
         if d.get("over_18"):
             continue
+        no_stats = bool(d.get("no_stats"))  # RSS source: numbers unknown
         score = d.get("score") or 0
-        if score < MIN_SCORE:
+        if not no_stats and score < MIN_SCORE:
             continue
         pid = d.get("id")
         if not pid or pid in posted_ids or pid in seen:
@@ -355,6 +452,7 @@ def pick_posts(posts: list, posted_ids: set) -> list:
             "subreddit": d.get("subreddit") or "",
             "selftext": (d.get("selftext") or "").strip()[:1500],
             "image": image_url,
+            "no_stats": no_stats,
         })
     picked.sort(key=lambda p: p["score"], reverse=True)
     return picked
@@ -485,15 +583,20 @@ def build_post_text(post: dict, translation: dict) -> str:
         lines.append("")
         lines.append(translation["summary_fa"])
     lines.append("")
-    lines.append(
-        f"⬆️ {humanize_fa(post['score'])} امتیاز • "
-        f"💬 {humanize_fa(post['comments'])} دیدگاه • r/{post['subreddit']}"
-    )
+    lines.append(_stats_line(post))
     if translation.get("hashtags"):
         lines.append("")
         lines.append(" ".join(translation["hashtags"]))
     # channel handle: exactly two lines below the last word
     return append_signature("\n".join(lines))
+
+
+def _stats_line(post: dict) -> str:
+    """Stats footer: real numbers when known, subreddit-only for RSS posts."""
+    if post.get("no_stats"):
+        return f"r/{post['subreddit']}"
+    return (f"⬆️ {humanize_fa(post['score'])} امتیاز • "
+            f"💬 {humanize_fa(post['comments'])} دیدگاه • r/{post['subreddit']}")
 
 
 def build_caption(post: dict, translation: dict) -> str:
@@ -504,8 +607,7 @@ def build_caption(post: dict, translation: dict) -> str:
     compact_lines = [
         f"{translation['emoji']} {translation['title_fa']}",
         "",
-        (f"⬆️ {humanize_fa(post['score'])} امتیاز • "
-         f"💬 {humanize_fa(post['comments'])} دیدگاه • r/{post['subreddit']}"),
+        _stats_line(post),
     ]
     if translation.get("hashtags"):
         compact_lines.append("")
@@ -617,6 +719,17 @@ def reddit_report() -> str:
             lines.append(f"pullpush: HTTP {resp.status_code} — ERROR")
     except Exception as exc:
         lines.append(f"pullpush: {exc}")
+    try:
+        resp = requests.get(f"https://www.reddit.com/r/{SUBREDDITS[0]}/top.rss",
+                            params={"t": "day"},
+                            headers={"User-Agent": RSS_UA}, timeout=(15, 60))
+        if resp.status_code == 200:
+            n = len(_parse_reddit_atom(resp.text, SUBREDDITS[0]))
+            lines.append(f"rss ({SUBREDDITS[0]}): HTTP 200, entries={n} — OK")
+        else:
+            lines.append(f"rss: HTTP {resp.status_code} — ERROR")
+    except Exception as exc:
+        lines.append(f"rss: {exc}")
     lines.append(
         "OAuth credentials: " + ("present" if REDDIT_CLIENT_ID else "not set (optional)")
     )
