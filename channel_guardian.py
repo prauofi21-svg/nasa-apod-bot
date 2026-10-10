@@ -252,7 +252,8 @@ def fetch_channel_page(before: int | None = None) -> str:
                                 timeout=(10, 30))
             if resp.status_code == 200 and "tgme_widget_message" in resp.text:
                 return resp.text
-            last = GuardianError(f"preview HTTP {resp.status_code}")
+            last = GuardianError(
+                f"preview HTTP {resp.status_code}, body starts: {resp.text[:120]!r}")
         except requests.RequestException as exc:
             last = GuardianError(f"preview request failed: {exc}")
         time.sleep(5 * (attempt + 1))
@@ -652,13 +653,21 @@ def phase_apod(now: datetime, view: ChannelView, dry: bool) -> PhaseReport:
 
         # -- 3) missing → backfill via the bot -------------------------------
         if not posts and due and d not in sdates:
+            is_today = (d == today.isoformat())
+            if not is_today and not view.available:
+                # Backfilling an OLDER day without channel evidence could
+                # duplicate a post that actually went out (state history only
+                # started recently) — never risk that; the note says it all.
+                r.notes.append(f"{d}: no channel evidence for backfill "
+                               f"(preview unavailable) — skipped safely")
+                continue
             if dry:
                 r.healed.append(f"[dry] {d}: missing — would run "
                                 f"{APOD_BOT} --date {d}")
                 dry_reported = True
             else:
                 if run_bot(APOD_BOT, ["--date", d], APOD_BOT_TIMEOUT):
-                    time.sleep(20)                       # let t.me/s index it
+                    time.sleep(20)                   # let t.me/s index it
                     view.refresh()
                     posts = view.apod_for(d) if view.available else []
 
