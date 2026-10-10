@@ -1,0 +1,44 @@
+name: Channel Cleanup (temporary)
+
+# One-off: deletes the 5 duplicate Reddit messages (ids 198-202) that were
+# double-posted on 2026-10-10 by two overlapping manual runs (the second run
+# checked out a stale state_reddit.json before the first run's push landed).
+# The root cause is fixed in reddit-top-daily.yml (git reset --hard before
+# the bot runs); this workflow only removes the duplicated channel messages.
+
+on:
+  workflow_dispatch:
+    inputs:
+      message_ids:
+        description: "Comma-separated message ids to delete"
+        required: true
+        default: "198,199,200,201,202"
+
+jobs:
+  cleanup:
+    name: Delete duplicate messages
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Delete messages
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          IDS: ${{ inputs.message_ids }}
+        run: |
+          python - <<'EOF'
+          import os
+          import requests
+          TG = os.environ["TELEGRAM_BOT_TOKEN"]
+          CHAT = os.environ["TELEGRAM_CHAT_ID"]
+          ids = [m.strip() for m in os.environ["IDS"].split(",") if m.strip()]
+          for mid in ids:
+              r = requests.post(
+                  f"https://api.telegram.org/bot{TG}/deleteMessage",
+                  json={"chat_id": CHAT, "message_id": int(mid)},
+                  timeout=30,
+              )
+              body = r.json()
+              print(f"delete {mid}: HTTP {r.status_code} ok={body.get('ok')} "
+                    f"{body.get('description', '')}")
+          EOF
