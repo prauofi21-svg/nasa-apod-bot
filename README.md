@@ -97,6 +97,7 @@
 
 - **Reddit Top Daily Post**: تیک `dry_run` = عیب‌یابی (دریافت + ترجمه بدون ارسال)، تیک `force` = نادیده‌گرفتن ضدتکرار و سهمیه
 - **NASA APOD Daily Post**: تیک `force` = ارسال مجدد همان روز، تیک `dry_run` = پیش‌نمایش ترجمه بدون ارسال
+- **Channel Cleanup**: حذف پیام‌های خاص کانال با شمارهٔ پیام (شناسه‌ها از t.me/s/daily_sciences قابل مشاهده‌اند — فرمت daily_sciences/NNN)
 
 اجرای محلی:
 
