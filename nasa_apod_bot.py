@@ -466,6 +466,25 @@ def fetch_apod(date: str = None) -> dict:
                     last_error = RuntimeError(f"NASA API error: {desc}")
                 except requests.RequestException as exc:
                     last_error = exc
+                # Plain API failure (e.g. the "today" query's HTTP 500).
+                # Historically 500 meant "today's entry not published yet"
+                # and walking back to older days was correct — but during
+                # the science.nasa.gov migration the API runs a whole day
+                # STALE, so walking back returns YESTERDAY's already-posted
+                # entry and today gets silently skipped (2026-10-16: the
+                # no-date query 500'd, the walkback no-op'd on Oct-15, and
+                # the channel stayed without its daily post). The RSS feed
+                # is the authority on what the current APOD is — recover
+                # from the web BEFORE walking back, for any candidate date.
+                if scrape_budget > 0:
+                    scrape_budget -= 1
+                    log.warning(
+                        "NASA API query failed for %s (%s) — recovering from science.nasa.gov",
+                        cand or "today", last_error,
+                    )
+                    recovered = scrape_apod_web(cand)
+                    if recovered:
+                        return recovered
                 time.sleep(5)
         if cycle < 3:
             pause = 60 * cycle
