@@ -446,7 +446,7 @@ def fetch_apod(date: str = None) -> dict:
                                     "recovering the real APOD from science.nasa.gov",
                                     payload.get("date") or "today",
                                 )
-                                recovered = scrape_apod_web()
+                                recovered = scrape_apod_web(cand)
                                 if recovered:
                                     return recovered
                             last_error = RuntimeError(
@@ -591,11 +591,16 @@ def _latest_apod_entries_feed(session) -> list:
     return entries
 
 
-def scrape_apod_web() -> dict | None:
+def scrape_apod_web(date: str | None = None) -> dict | None:
     """
-    Recover the REAL current APOD from science.nasa.gov when the API serves
+    Recover the REAL APOD from science.nasa.gov when the API serves
     its placeholder record. The website always carries the genuine daily
     entry as an "image-article" page. Returns an API-shaped dict, or None.
+
+    `date` (YYYY-MM-DD) makes the recovery target THAT day's article — the
+    guardian's --date backfills must publish exactly the requested day, not
+    whatever is newest. Without `date` the newest entry wins (the current
+    APOD).
     """
     session = requests.Session()
     # Discovery: RSS first (authoritative + fresh), homepage as fallback.
@@ -613,7 +618,15 @@ def scrape_apod_web() -> dict | None:
         log.warning("APOD web discovery: no daily article links found "
                     "(feed and homepage both empty)")
         return None
-    date, href = max(entries, key=lambda e: e[0])
+    if date:
+        wanted = [e for e in entries if e[0] == date]
+        if not wanted:
+            log.warning("APOD web discovery: no article link for %s "
+                        "(feed/homepage only cover recent days)", date)
+            return None
+        _, href = wanted[0]
+    else:
+        _, href = max(entries, key=lambda e: e[0])
     article = _web_get(session, href, validate=_is_apod_article)
     if article is None:
         return None
@@ -686,6 +699,50 @@ def scrape_apod_web() -> dict | None:
             gif_url = html.unescape(m.group(1))
             break
 
+    # --- self-hosted video days (2026-10-16 layout) -------------------------
+    # Some days the daily media is an MP4 embedded via <video>/<source> (plus
+    # a VideoObject ld+json block). On those pages og:image is stuck on the
+    # site logo and the NewsArticle thumbnail is EMPTY, so the image-candidate
+    # path below would find nothing and the whole day would be skipped. The
+    # MP4 (or the embedded player URL) IS the daily media — surface it and
+    # let the existing video posting path (sendVideo / yt-dlp / thumbnail)
+    # handle the rest.
+    video_url = ""
+    video_poster = ""
+    m = re.search(r'<video[^>]*\sposter="([^"]+)"', txt)
+    if m:
+        video_poster = html.unescape(m.group(1))
+    for ld in re.findall(
+            r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', txt, re.S):
+        try:
+            data = json.loads(ld)
+        except ValueError:
+            continue
+        graphs = data.get("@graph") if isinstance(data, dict) else None
+        for g in (graphs or ([data] if isinstance(data, dict) else [])):
+            if not isinstance(g, dict) or g.get("@type") != "VideoObject":
+                continue
+            u = str(g.get("contentUrl") or "").strip()
+            if u.lower().startswith("http"):
+                video_url = html.unescape(u)   # the real media file
+                break
+            u = str(g.get("embedUrl") or "").strip()
+            # embedUrl is the PLAYER url — only trust players yt-dlp can
+            # actually download (YouTube/Vimeo); anything else is ignored
+            if u and re.search(r"youtube\.com|youtu\.be|vimeo\.com", u):
+                video_url = html.unescape(u)
+                break
+        if video_url:
+            break
+    if not video_url:
+        m = re.search(
+            r'<source[^>]+src="(https?://[^"]+?\.(?:mp4|m4v)[^"]*)"', txt)
+        if not m:
+            m = re.search(
+                r'<video[^>]+src="(https?://[^"]+?\.(?:mp4|m4v)[^"]*)"', txt)
+        if m:
+            video_url = html.unescape(m.group(1))
+
     # --- image candidates ---
     ogi = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]*)"', txt)
     og_image = html.unescape(ogi.group(1)) if ogi else ""
@@ -724,6 +781,24 @@ def scrape_apod_web() -> dict | None:
         if "logo" in u.lower() or "/wp-content/themes/" in u.lower():
             continue
         candidates.append(u)
+
+    # a real embedded video beats every image candidate — it IS the daily
+    # media (image candidates on such days are junk: logo, empty, sidebar)
+    if video_url:
+        log.info("Web recovery: %s — %s (credit: %s; video day: %s)",
+                 date, title, credit or "?", video_url[:100])
+        return {
+            "date": date,
+            "title": title.strip(),
+            "explanation": explanation,
+            "media_type": "video",
+            "url": video_url,
+            "thumbnail_url": video_poster,
+            "copyright": credit,
+            "service_version": "web-recovery",
+            "source": "science.nasa.gov",
+        }
+
     if not candidates:
         log.warning("APOD article %s: no usable image URL found", date)
         return None
@@ -909,10 +984,63 @@ def select_image(paths: list):
 
 
 def download_video(url: str, workdir: Path):
-    """Try to download the actual video file (<=480p mp4, <=48 MB)."""
+    """Try to download the actual video file (<=48 MB).
+
+    Two paths:
+      - DIRECT media files (science.nasa.gov serves APOD videos as plain
+        MP4s, e.g. 2026-10-16 "Chasing the ISS"): a plain HTTP download
+        with a HEAD size check first. yt-dlp's generic extractor would also
+        fetch it, but the format selector cannot shrink a bare file and its
+        failure modes on plain assets are needlessly varied.
+      - Everything else (YouTube/Vimeo player URLs): yt-dlp as before,
+        capped at 480p.
+    """
     if not SEND_VIDEO_IF_POSSIBLE:
         log.info("SEND_VIDEO_IF_POSSIBLE=false — skipping the video file")
         return None
+    direct = bool(re.search(r"\.(?:mp4|m4v)(?:[?#]|$)", (url or "").lower()))
+    if direct:
+        try:
+            # identity encoding: the CDN gzips HEAD responses (dropping
+            # content-length) unless we explicitly opt out
+            head = requests.head(url, timeout=(15, 30), allow_redirects=True,
+                                 headers={**WEB_HEADERS,
+                                          "Accept-Encoding": "identity"})
+            size = int(head.headers.get("content-length") or 0)
+            if size and size > MAX_FILE_SIZE:
+                log.warning("Direct video is %.1f MB — over the %.0f MB cap, "
+                            "falling back to the preview image",
+                            size / 1e6, MAX_FILE_SIZE / 1e6)
+                return None
+            resp = requests.get(url, timeout=(30, 180), stream=True,
+                                headers=WEB_HEADERS)
+            resp.raise_for_status()
+            path = workdir / "apod_video.mp4"
+            total = 0
+            too_big = False
+            with open(path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1 << 20):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_FILE_SIZE:
+                        too_big = True
+                        break
+                    fh.write(chunk)
+            if too_big:
+                log.warning("Direct video exceeded %.0f MB mid-download "
+                            "— falling back to the preview image",
+                            MAX_FILE_SIZE / 1e6)
+                path.unlink(missing_ok=True)
+                return None
+            if total < 100_000:
+                log.warning("Direct video too small (%d bytes) — discarding", total)
+                path.unlink(missing_ok=True)
+                return None
+            log.info("Direct video saved (%.1f MB)", total / 1e6)
+            return path
+        except requests.RequestException as exc:
+            log.warning("Direct video download failed (%s) — trying yt-dlp", exc)
     if not YTDLP_AVAILABLE:
         log.warning("yt-dlp is not installed — will fall back to the preview image")
         return None
