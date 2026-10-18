@@ -145,6 +145,31 @@ def pretty_date(iso_date: str) -> str:
         return iso_date or ""
 
 
+def _watch_url(url: str) -> str:
+    """Normalize a player/embed URL into a user-friendly watch URL.
+
+    On YouTube-embed video days the scraped URL is an /embed/ player link;
+    readers get a cleaner experience from the canonical watch URL. Direct
+    file URLs (self-hosted MP4 days) and foreign URLs pass through as-is.
+    """
+    url = (url or "").strip()
+    m = re.search(r"youtube\.com/embed/([A-Za-z0-9_-]{6,})", url)
+    if m:
+        return f"https://www.youtube.com/watch?v={m.group(1)}"
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{6,})", url)
+    if m:
+        return f"https://www.youtube.com/watch?v={m.group(1)}"
+    m = re.search(r"youtube\.com/watch\?v=([A-Za-z0-9_-]{6,})", url)
+    if m:
+        return f"https://www.youtube.com/watch?v={m.group(1)}"
+    m = re.search(r"player\.vimeo\.com/video/(\d+)", url)
+    if m:
+        return f"https://vimeo.com/{m.group(1)}"
+    if url.lower().startswith("http"):
+        return url
+    return ""
+
+
 def build_header(apod: dict, video_preview: bool = False) -> str:
     """Compact header used as the media caption on long posts."""
     lines = [
@@ -158,6 +183,9 @@ def build_header(apod: dict, video_preview: bool = False) -> str:
         lines.append(f"🔭 Credit: {credit}")
     if video_preview:
         lines.append("🎞 Today's APOD is a video — preview image shown.")
+        watch = _watch_url(apod.get("url") or "")
+        if watch:
+            lines.append(f"▶️ Watch the video: {watch}")
     header = "\n".join(lines)
     if len(header) > MAX_CAPTION_LEN:
         header = header[: MAX_CAPTION_LEN - 1] + "…"
@@ -253,6 +281,9 @@ def build_persian_header(apod: dict, translation: dict, video_preview: bool = Fa
         lines.append(f"🔭 اعتبار: {credit}")
     if video_preview:
         lines.append("🎞 موضوع امروز یک ویدئو است؛ تصویر بالا پیش‌نمایشی از آن است.")
+        watch = _watch_url(apod.get("url") or "")
+        if watch:
+            lines.append(f"▶️ تماشای ویدئو: {watch}")
     tags = translation.get("hashtags") or []
     if tags:
         lines.append("")
@@ -741,8 +772,26 @@ def scrape_apod_web(date: str | None = None) -> dict | None:
         for g in (graphs or ([data] if isinstance(data, dict) else [])):
             if not isinstance(g, dict) or g.get("@type") != "VideoObject":
                 continue
+            # thumbnailUrl — the OFFICIAL poster/preview image of the day's
+            # video (YouTube-embed days carry it here, hosted on NASA's own
+            # CDN — exactly the host this scrape just succeeded against, so
+            # it is as reliable as the scrape itself). May be a str or a list.
+            tu = g.get("thumbnailUrl")
+            if isinstance(tu, list):
+                tu = next((str(x) for x in tu if str(x).strip()), "")
+            tu = str(tu or "").strip()
+            if (tu.lower().startswith("http") and not video_poster
+                    and "logo" not in tu.lower()):
+                video_poster = html.unescape(tu)
+            # contentUrl — only trust it when it REALLY is a media file.
+            # On YouTube-embed days some ld+json blocks carry a contentUrl
+            # that is just the NASA site LOGO (a .png); treating that as
+            # "the video" is wrong (2026-10-18: it would shadow the real
+            # embedUrl and waste the direct-download path on a logo).
             u = str(g.get("contentUrl") or "").strip()
-            if u.lower().startswith("http"):
+            if (u.lower().startswith("http")
+                    and re.search(r"\.(?:mp4|m4v|webm)(?:[?#]|$)", u.lower())
+                    and "logo" not in u.lower()):
                 video_url = html.unescape(u)   # the real media file
                 break
             u = str(g.get("embedUrl") or "").strip()
@@ -804,6 +853,21 @@ def scrape_apod_web(date: str | None = None) -> dict | None:
     # a real embedded video beats every image candidate — it IS the daily
     # media (image candidates on such days are junk: logo, empty, sidebar)
     if video_url:
+        # Poster candidates for the video-day fallback chain: the <video
+        # poster> attr / the VideoObject thumbnailUrl (both may exist), the
+        # og:image original, the NewsArticle dynamicimage, and og:image
+        # itself. All are on NASA's own CDN — the same host the scrape just
+        # succeeded against — so at least one of them is as reliable as the
+        # scrape. 2026-10-18 taught the hard lesson: a video day WITHOUT a
+        # usable poster candidate (yt-dlp blocked by YouTube's bot check,
+        # hqdefault rejected by a byte-size rule) ended the day postless.
+        poster_candidates = []
+        for u in (video_poster, dam_original, dyn, og_image):
+            if not u or u in poster_candidates:
+                continue
+            if "logo" in u.lower() or "/wp-content/themes/" in u.lower():
+                continue
+            poster_candidates.append(u)
         log.info("Web recovery: %s — %s (credit: %s; video day: %s)",
                  date, title, credit or "?", video_url[:100])
         return {
@@ -812,7 +876,8 @@ def scrape_apod_web(date: str | None = None) -> dict | None:
             "explanation": explanation,
             "media_type": "video",
             "url": video_url,
-            "thumbnail_url": video_poster,
+            "thumbnail_url": poster_candidates[0] if poster_candidates else "",
+            "extra_image_urls": poster_candidates[1:],
             "copyright": credit,
             "service_version": "web-recovery",
             "source": "science.nasa.gov",
@@ -894,7 +959,7 @@ def download_images(apod: dict, workdir: Path) -> list:
     for idx, url in enumerate(candidates):
         try:
             log.info("Downloading image: %s", url)
-            resp = requests.get(url, timeout=(30, 180))
+            resp = requests.get(url, timeout=(30, 180), headers=WEB_HEADERS)
             resp.raise_for_status()
             content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
             if content_type and not content_type.startswith("image/"):
@@ -1078,8 +1143,20 @@ def download_video(url: str, workdir: Path):
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
     except Exception as exc:  # yt-dlp raises many exception types
-        log.warning("Video download failed (%s) — will fall back to the preview image", exc)
-        return None
+        # YouTube bot-blocks datacenter IPs ("Sign in to confirm you're not
+        # a bot") — the tv innertube client often still works from them.
+        # One cheap retry; if it also fails, the poster fallback takes over.
+        log.warning("Video download failed (%s) — retrying with the tv/android "
+                    "player clients", exc)
+        retry_opts = dict(opts)
+        retry_opts["extractor_args"] = {"youtube": {"player_client": ["tv", "android"]}}
+        try:
+            with yt_dlp.YoutubeDL(retry_opts) as ydl:
+                ydl.download([url])
+        except Exception as exc2:
+            log.warning("Video download failed again (%s) — will fall back to "
+                        "the preview image", exc2)
+            return None
     for candidate in sorted(workdir.glob("apod_video.*")):
         if candidate.suffix.lower() != ".mp4":
             continue
@@ -1093,30 +1170,57 @@ def download_video(url: str, workdir: Path):
 
 
 def download_thumbnail(apod: dict, workdir: Path):
-    """Download a preview image for video days. Returns path/None."""
+    """Download a preview image for video days. Returns path/None.
+
+    Candidate order: the APOD's own poster (thumbnail_url — scraped from
+    the VideoObject/<video poster>, hosted on NASA's CDN), then the page's
+    remaining image candidates (extra_image_urls), then the YouTube
+    thumbnail sizes (plus the img.youtube.com mirror host).
+
+    Validation is decode-based (_image_size_ok), NOT byte-size-based: a
+    genuine YouTube hqdefault is 480x360 at ~12 KB — the old "< 15,000
+    bytes" rule rejected it as a placeholder, which is exactly how
+    2026-10-18 lost its post. The real gray placeholder is 120x90 and
+    fails the 400x240 decode gate.
+    """
     candidates = []
     thumb = apod.get("thumbnail_url")
     if thumb:
         candidates.append(thumb)
+    for u in (apod.get("extra_image_urls") or []):
+        if u and u not in candidates:
+            candidates.append(u)
     match = re.search(
         r"(?:youtube\.com/(?:embed/|watch\?v=)|youtu\.be/)([A-Za-z0-9_-]{6,})",
         apod.get("url", "") or "",
     )
     if match:
         vid = match.group(1)
-        candidates.append(f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg")
-        candidates.append(f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg")
+        for u in (
+            f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
+            f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+            f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
+        ):
+            if u not in candidates:
+                candidates.append(u)
     for url in candidates:
         try:
-            resp = requests.get(url, timeout=(30, 60))
+            resp = requests.get(url, timeout=(30, 60), headers=WEB_HEADERS)
             if resp.status_code != 200:
                 continue
             data = resp.content
-            if len(data) < 15_000:  # YouTube placeholder images are tiny
+            ok, width, height = _image_size_ok(data)
+            if not ok:
+                # hqdefault (480x360) passes the gate; only true
+                # placeholders (120x90) and broken files land here
+                log.warning("Video preview candidate unusable "
+                            "(%dx%d, %d bytes): %s",
+                            width, height, len(data), url)
                 continue
             path = workdir / "apod_thumb.jpg"
             path.write_bytes(data)
-            log.info("Video preview image saved")
+            log.info("Video preview image saved (%dx%d, %d bytes) from %s",
+                     width, height, len(data), url)
             return path
         except requests.RequestException:
             continue
@@ -1133,6 +1237,15 @@ def prepare_media(apod: dict):
         thumb = download_thumbnail(apod, workdir)
         if thumb:
             return thumb, True
+        # last layer for video days: the regular image machinery. On video
+        # days extra_image_urls carries the page's poster candidates, and
+        # download_images validates them by decoding — one more independent
+        # pass in case the thumbnail downloader failed for a transient
+        # reason (a redirect, a flaky CDN edge, ...).
+        image = select_image(download_images(apod, workdir))
+        if image:
+            log.info("Video preview via the image-candidate path")
+            return image, True
         return None, True
     image = select_image(download_images(apod, workdir))
     if image:
