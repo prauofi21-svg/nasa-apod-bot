@@ -1,0 +1,95 @@
+name: Meta Guardian
+
+# The scheduling safety net for every cron-triggered pipeline in this repo
+# (NASA APOD Daily Post, Reddit Top Daily Post, Channel Guardian).
+#
+# WHY (2026-10-19): GitHub's cron scheduler silently died for THIS repo —
+# after 2026-10-18T23:23Z not a single scheduled trigger fired for 17+ hours
+# (all 8 NASA slots, all 6 Reddit slots and all 3 Guardian slots were
+# silently dropped, the channel stayed silent) while the same account's
+# other repo scheduled normally and workflow_dispatch worked flawlessly.
+# Cron-only resilience is not enough.
+#
+# TWO independent scheduling engines with different failure modes:
+#   Engine 1 — cron "7,37 * * * *": alive whenever GitHub's scheduler is
+#     healthy. While the self-chain below is alive, these runs are simply
+#     superseded by the concurrency group (no double beats); if the chain
+#     ever breaks, the next cron beat restarts it within 30 minutes.
+#   Engine 2 — the self-chaining beat loop: each run checks the pipelines,
+#     sleeps ~26 min, then dispatches the NEXT beat with workflow_dispatch,
+#     which does not depend on the cron scheduler at all.
+# A third, independent engine lives in the jadvalak repo: its Gateway
+# watchdog (whose cron kept firing through the 2026-10-19 outage) dispatches
+# this workflow cross-repo whenever it has been silent for > 2.5 h.
+#
+# What a beat checks (meta_guardian.py — every dispatch target is
+# state-protected, so an extra dispatch is a safe no-op when the channel
+# is healthy; this loop can never double-post):
+#   NASA      state.json.date != today  AND now >= 21:45 UTC
+#             -> dispatch nasa-apod-daily.yml  (ALL evening slots missed)
+#   Reddit    state_reddit.day != today AND now >= 10:20 UTC
+#             -> dispatch reddit-top-daily.yml (main slot missed)
+#   Guardian  last run older than 13 h  (max legit gap is 10h50m)
+#             -> dispatch channel-guardian.yml (deep verify + backfills)
+# Partial Reddit days (1-4 of 5 posts) are deliberately NOT a meta rule —
+# reading the real channel and healing partial days is the Channel
+# Guardian's own specialty; the meta layer only guarantees SOMETHING runs.
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"    # engine 1 — off-the-hour marks (less congested)
+  workflow_dispatch:
+    inputs:
+      beat_minutes:
+        description: "minutes this beat sleeps before chaining the next"
+        required: false
+        default: "26"
+      no_chain:
+        description: "single beat — do not chain (tests / manual checks)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  actions: write    # dispatch NASA / Reddit / Guardian / the next beat
+  contents: read    # read state.json / state_reddit.json
+
+concurrency:
+  group: meta-guardian
+  cancel-in-progress: false   # a cron beat never kills a live chained beat
+
+jobs:
+  beat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check pipelines and dispatch whatever is overdue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BEAT_MINUTES: ${{ inputs.beat_minutes || '26' }}
+        run: python3 meta_guardian.py
+
+      - name: Chain the next beat
+        # always() — even when the check step failed, the loop must live on:
+        # the loop itself is the point, and a broken beat heals next beat.
+        # (409/422 are accepted: superseded-by-cron or already-queued — the
+        # engine-1 cron run carries the loop on in exactly those cases.)
+        if: ${{ always() && inputs.no_chain != true }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          sleep 5   # let any dispatch above land in the queue first
+          CODE=$(curl -s -o /tmp/resp.json -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows/meta-guardian.yml/dispatches" \
+            -d '{"ref":"main","inputs":{"beat_minutes":"26"}}')
+          echo "chain dispatch -> HTTP $CODE $(cat /tmp/resp.json)"
+          case "$CODE" in
+            204|409|422) echo "chain OK (204 dispatched / 409-422 superseded)"; exit 0 ;;
+            *) echo "chain dispatch FAILED"; exit 1 ;;
+          esac
