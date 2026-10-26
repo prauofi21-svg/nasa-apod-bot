@@ -27,15 +27,21 @@ WHAT A BEAT DOES (all times UTC; every dispatch target is state-protected —
 state.json / state_reddit.json make an extra dispatch a safe no-op whenever
 the channel is already healthy, so this loop can never double-post):
 
-  NASA      state.json.date != today AND now >= 21:45
+  NASA      state.json.date != today AND now >= 17:40
             -> dispatch nasa-apod-daily.yml
-            (all seven evening slots 17:30-21:20 plus grace have passed
-            without today's post; retries every beat until one succeeds —
-            one success flips the state and the rule goes quiet)
+            (10 min after the MAIN 17:30 slot. The old rule waited for ALL
+            evening slots until 21:45 — but GitHub's cron brownouts drop
+            slots for whole days (2026-10-26: 17:30, 18:15 and 19:05 were
+            all silently dropped), which made the post 3+ hours late.
+            Now the FIRST missed main slot triggers a dispatch within one
+            beat (~26 min), and every beat retries until one succeeds —
+            one success flips the state and the rule goes quiet. An
+            in-flight NASA run is never double-dispatched.)
   Reddit    state_reddit.json.day != today AND now >= 10:20
             -> dispatch reddit-top-daily.yml
             (the 10:00 main slot produced nothing for the whole day so far;
-            retries every beat — one success flips the state)
+            retries every beat — one success flips the state; in-flight
+            runs are skipped)
   Guardian  last Channel Guardian run older than 13 h
             -> dispatch channel-guardian.yml
             (its scheduled slots 09:55/22:10/23:05 have a max legit gap of
@@ -68,7 +74,7 @@ NASA_WF = "nasa-apod-daily.yml"
 REDDIT_WF = "reddit-top-daily.yml"
 GUARDIAN_WF = "channel-guardian.yml"
 
-NASA_EVENING_GRACE_MIN = 21 * 60 + 45   # after ALL evening slots + 25 min
+NASA_MAIN_GRACE_MIN = 17 * 60 + 40     # main 17:30Z slot + 10 min grace
 REDDIT_MAIN_GRACE_MIN = 10 * 60 + 20    # main 10:00 slot + 20 min grace
 GUARDIAN_MAX_GAP_H = 13.0               # max legit gap is 10h50m
 BEAT_DEFAULT_MIN = 26
@@ -131,17 +137,37 @@ def minutes_now_utc():
     return now.hour * 60 + now.minute, now
 
 
+def run_in_progress(workflow):
+    """True when the workflow has a queued/in-progress run right now.
+
+    Dispatching on top of an in-flight run just burns queue slots (the
+    channel-pipelines concurrency group serializes them anyway) — and a
+    pending queued run already IS the retry we wanted.
+    """
+    try:
+        runs = api(f"/repos/{REPO}/actions/workflows/{workflow}/runs?per_page=5")
+        for r in (runs.get("workflow_runs") or [])[:5]:
+            if r.get("status") in ("queued", "in_progress", "waiting", "pending"):
+                return True
+    except Exception as exc:  # noqa: BLE001 — never break the beat
+        log(f"run-in-progress check error for {workflow}: {exc}")
+    return False
+
+
 def check_nasa(today, minutes_now):
     state = read_state("state.json")
     nasa_date = (state or {}).get("date")
     log(f"NASA state date={nasa_date} (today={today})")
     if nasa_date is not None and nasa_date == today:
         return
-    if minutes_now >= NASA_EVENING_GRACE_MIN:
-        dispatch(NASA_WF,
-                 f"all evening slots passed with date={nasa_date} != {today}")
-    else:
-        log("NASA not due yet (evening slots still ahead) — no dispatch")
+    if minutes_now < NASA_MAIN_GRACE_MIN:
+        log("NASA not due yet (main 17:30Z slot still ahead) — no dispatch")
+        return
+    if run_in_progress(NASA_WF):
+        log("a NASA run is queued/in flight — letting it finish first")
+        return
+    dispatch(NASA_WF,
+             f"main slot grace passed with date={nasa_date} != {today}")
 
 
 def check_reddit(today, minutes_now):
@@ -151,10 +177,13 @@ def check_reddit(today, minutes_now):
     log(f"Reddit state day={day} posts_today={posts_today} (today={today})")
     if day == today:
         return  # posted today (partial days are the Guardian's specialty)
-    if minutes_now >= REDDIT_MAIN_GRACE_MIN:
-        dispatch(REDDIT_WF, f"day={day} != {today} and the main slot is long gone")
-    else:
+    if minutes_now < REDDIT_MAIN_GRACE_MIN:
         log("Reddit not due yet (before the 10:00 main slot) — no dispatch")
+        return
+    if run_in_progress(REDDIT_WF):
+        log("a Reddit run is queued/in flight — letting it finish first")
+        return
+    dispatch(REDDIT_WF, f"day={day} != {today} and the main slot is long gone")
 
 
 def check_guardian():
