@@ -434,9 +434,12 @@ def fetch_apod(date: str = None) -> dict:
 
     NASA's API returns HTTP 500 for the "today" query when the current day's
     entry has not been published yet (typically in the hours before the new
-    APOD goes live) or during short outages. We therefore:
-      1. try "today" (no date param), and
-      2. if it keeps failing, walk back up to 3 previous days and use the
+    APOD goes live) or during short outages — and, as seen on 2026-10-26,
+    it can 500 for GitHub-runner IPs while serving other IPs fine. We
+    therefore:
+      1. try today's date EXPLICITLY first (precise, cache-friendly), then
+         the no-date "today" query, and
+      2. if both keep failing, walk back up to 3 previous days and use the
          most recent entry NASA can serve,
     repeating the whole cycle a few times so transient outages also heal.
     The returned entry's own `date` field drives duplicate protection, so a
@@ -447,7 +450,12 @@ def fetch_apod(date: str = None) -> dict:
     if date:
         candidates = [date.strip()]
     else:
-        candidates = [None] + [(today - timedelta(days=n)).isoformat() for n in range(1, 4)]
+        # Explicit today FIRST: when the no-date query 500s (runner-IP
+        # outages) the dated query often still works; and when BOTH fail,
+        # the web recovery below then targets today's date specifically
+        # instead of "whatever is newest".
+        candidates = [today.isoformat(), None] + [
+            (today - timedelta(days=n)).isoformat() for n in range(1, 4)]
     last_error = None
     scrape_budget = 3   # web-recovery attempts allowed across the whole fetch
     for cycle in range(1, 4):
@@ -484,7 +492,7 @@ def fetch_apod(date: str = None) -> dict:
                                 "NASA API placeholder; web recovery failed"
                             )
                             continue
-                        if cand:
+                        if cand and cand != today.isoformat():
                             log.warning(
                                 "Latest APOD unavailable — using the %s entry instead", cand
                             )
@@ -600,9 +608,13 @@ def _latest_apod_entries_home(home_text: str) -> list:
     """(date, href) pairs parsed from the /apod/ homepage HTML."""
     entries = []
     for href in re.findall(
-            r'href="(https?://science\.nasa\.gov/(?:image-article/)+apod-[^"]+)"',
+            r'href="(https?://science\.nasa\.gov/(?:image-article/)+apod(?:/|-)[^"]+)"',
             home_text):
-        m = re.search(r"/apod-(\d{4})-([a-z]+)-(\d{1,2})(?:-|/|$)", href)
+        # 2026-10-26: NASA serves the newest entry as .../apod/2026-october-
+        # 26-slug/ while older items keep .../apod-2026-october-25-slug —
+        # accept BOTH shapes or today becomes invisible (the silent-no-op
+        # bug that left 2026-10-26 postless).
+        m = re.search(r"/apod(?:/|-)(\d{4})-([a-z]+)-(\d{1,2})(?:-|/|$)", href)
         if not m:
             continue
         month = WEB_MONTHS.get(m.group(2).lower())
@@ -629,7 +641,11 @@ def _latest_apod_entries_feed(session) -> list:
         if not link:
             continue
         href = html.unescape(link.group(1)).strip()
-        m = re.search(r"/apod-(\d{4})-([a-z]+)-(\d{1,2})(?:-|/|$)", href)
+        # Accept BOTH feed URL shapes — 2026-10-26+: .../apod/2026-october-
+        # 26-slug/ for the newest entry, .../apod-2026-october-25-slug for
+        # older ones. Matching only the old shape made the bot believe the
+        # feed's newest entry was YESTERDAY and silently skip today.
+        m = re.search(r"/apod(?:/|-)(\d{4})-([a-z]+)-(\d{1,2})(?:-|/|$)", href)
         if not m:
             continue
         month = WEB_MONTHS.get(m.group(2).lower())
@@ -703,8 +719,12 @@ def scrape_apod_web(date: str | None = None) -> dict | None:
     explanation = ""
     m = re.search(r"Explanation:\s*</strong>(.*?)</p>", txt, re.S)
     if m:
-        explanation = html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))
+        # strip inline tags to EMPTY (not space) so "word</a>," keeps its
+        # punctuation attached — then re-normalize spacing and re-attach
+        # any stray " ," / " ." artifacts left by tag boundaries.
+        explanation = html.unescape(re.sub(r"<[^>]+>", "", m.group(1)))
         explanation = re.sub(r"\s+", " ", explanation).strip()
+        explanation = re.sub(r"\s+([,.;:!?])", r"\1", explanation)
 
     # --- credit (the article meta table has used several label variants) ---
     credit = ""
@@ -712,6 +732,10 @@ def scrape_apod_web(date: str | None = None) -> dict | None:
             # 2026-10 layout: <th ...>Credit:</th><td ...>
             #   <strong>Image Credit:</strong> <a ...>NASA</a>, ...</td>
             r"Credit:?\s*</th>\s*<td[^>]*>(.*?)</td>",
+            # 2026-10-26 layout: <th>Credit &amp; Copyright:</th> — the
+            # trailing COLON after "Copyright" is new and defeated the
+            # old pattern (2026-10-26 scraped with an empty credit)
+            r"Credit\s*(?:&|&amp;)\s*Copyright\s*:?\s*</th>\s*<td[^>]*>\s*(.*?)\s*</td>",
             # legacy layout: <th ...>Credit &amp; Copyright</th><td>...</td>
             r"Credit\s*(?:&|&amp;)\s*Copyright\s*</th>\s*<td[^>]*>\s*(.*?)\s*</td>",
             # last resort: bolded inline label
@@ -1539,6 +1563,7 @@ def main() -> int:
     validate_apod(apod)
     log.info("APOD fetched: %s — %s", apod.get("date"), apod.get("title"))
 
+    today_iso = datetime.now(timezone.utc).date().isoformat()
     force = args.force or os.environ.get("FORCE_POST", "").strip().lower() in ("1", "true", "yes", "on")
     if not args.dry_run and not force:
         state = load_state()
@@ -1546,7 +1571,18 @@ def main() -> int:
         if state.get("date"):
             posted_dates.add(state["date"])
         if apod.get("date") in posted_dates:
-            log.info("APOD for %s was already posted — nothing to do.", apod.get("date"))
+            if not args.date and apod.get("date") != today_iso:
+                # The fetch had to walk BACK to an already-posted day: today's
+                # entry is not published/discoverable yet (NASA-side lag or
+                # outage). Log it loudly — a silent "success" here is exactly
+                # how 2026-10-26 looked healthy while the channel stayed
+                # postless. Later slots / the Meta-Guardian keep retrying.
+                log.warning(
+                    "TODAY'S APOD (%s) NOT YET AVAILABLE — newest served was "
+                    "%s (already posted). Later slots will retry.",
+                    today_iso, apod.get("date"))
+            else:
+                log.info("APOD for %s was already posted — nothing to do.", apod.get("date"))
             return 0
 
     media_path, video_preview = prepare_media(apod)
