@@ -50,6 +50,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -604,23 +605,78 @@ def _is_apod_article(resp) -> bool:
     return "APOD:" in title and "Page not found" not in title
 
 
+def _apod_slug_date(href: str) -> str | None:
+    """Parse an APOD article URL slug into YYYY-MM-DD, order-agnostic.
+
+    NASA has served THREE slug shapes in Oct 2026 alone:
+      apod-2026-october-28-slug     (year-month-day, the classic)
+      apod/2026-october-26-slug     (slash variant, 2026-10-26+)
+      apod-29-october-2026-slug     (DAY-month-YEAR, 2026-10-29!)
+    Each time the discovery regex assumed one fixed order, the newest entry
+    turned invisible and a whole day went postless with a green checkmark.
+    Instead of guessing the next permutation, classify the three tokens
+    after 'apod' by WHAT they are: a 4-digit number is the year, a month
+    name is the month, a 1-2-digit number is the day — wherever they sit.
+    Returns None when the slug carries no recognisable date.
+    """
+    m = re.search(
+        r"/apod(?:/|-)((?:\d{1,4}|[a-z]+)-(?:\d{1,4}|[a-z]+)-(?:\d{1,4}|[a-z]+))",
+        href, re.I)
+    if not m:
+        return None
+    parts = [p.lower() for p in m.group(1).split("-")]
+    if len(parts) != 3:
+        return None
+    month = next((WEB_MONTHS[p] for p in parts if p in WEB_MONTHS), None)
+    if not month:
+        return None
+    nums = [p for p in parts if p.isdigit()]
+    year = next((int(p) for p in nums if len(p) == 4), None)
+    day = next((int(p) for p in nums if len(p) <= 2), None)
+    if not year or not day or not (1 <= day <= 31) or not (1995 <= year <= 2100):
+        return None
+    return f"{year}-{month:02d}-{day:02d}"
+
+
+def _feed_item_date(item: str, href: str) -> str | None:
+    """Date a feed <item>: pubDate first, URL slug as fallback.
+
+    The RSS <pubDate> is emitted by NASA's CMS (stable RFC-822 format for
+    decades, always 04:05 UTC on the APOD's own day) and is completely
+    independent of whatever slug format the article URL uses — so it is
+    the primary source. The slug keeps working as a fallback for feeds
+    that lack pubDate. When both parse but disagree, the pubDate wins
+    (CMS-generated) and a warning is logged for visibility.
+    """
+    pub = None
+    m = re.search(r"<pubDate>\s*([^<]+?)\s*</pubDate>", item)
+    if m:
+        try:
+            dt = parsedate_to_datetime(m.group(1))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            pub = dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        except (TypeError, ValueError) as exc:
+            log.warning("APOD feed: unparsable pubDate %r (%s)", m.group(1), exc)
+    slug = _apod_slug_date(href)
+    if pub and slug and pub != slug:
+        log.warning("APOD feed: pubDate %s != slug date %s for %s — using pubDate",
+                    pub, slug, href[:90])
+    return pub or slug
+
+
 def _latest_apod_entries_home(home_text: str) -> list:
     """(date, href) pairs parsed from the /apod/ homepage HTML."""
     entries = []
     for href in re.findall(
-            r'href="(https?://science\.nasa\.gov/(?:image-article/)+apod(?:/|-)[^"]+)"',
+            r'href="(https?://science\.nasa\.gov/(?:[a-z]+-article/)+apod(?:/|-)[^"]+)"',
             home_text):
-        # 2026-10-26: NASA serves the newest entry as .../apod/2026-october-
-        # 26-slug/ while older items keep .../apod-2026-october-25-slug —
-        # accept BOTH shapes or today becomes invisible (the silent-no-op
-        # bug that left 2026-10-26 postless).
-        m = re.search(r"/apod(?:/|-)(\d{4})-([a-z]+)-(\d{1,2})(?:-|/|$)", href)
-        if not m:
+        # Order-agnostic slug dating (see _apod_slug_date): NASA has already
+        # used year-first, slash-prefixed AND day-first slugs — matching any
+        # single fixed order made that day's entry invisible and postless.
+        date = _apod_slug_date(href)
+        if not date:
             continue
-        month = WEB_MONTHS.get(m.group(2).lower())
-        if not month:
-            continue
-        date = f"{m.group(1)}-{month:02d}-{int(m.group(3)):02d}"
         if (date, href) not in entries:
             entries.append((date, href))
     return entries
@@ -631,6 +687,8 @@ def _latest_apod_entries_feed(session) -> list:
 
     The feed is the authoritative "what is the current APOD" source — the
     homepage can lag a whole day behind. Falls back to [] on any failure.
+    Dates come from <pubDate> first (format-stable, slug-independent) and
+    the URL slug second — see _feed_item_date.
     """
     feed = _web_get(session, APOD_WEB_FEED)
     if feed is None:
@@ -641,17 +699,10 @@ def _latest_apod_entries_feed(session) -> list:
         if not link:
             continue
         href = html.unescape(link.group(1)).strip()
-        # Accept BOTH feed URL shapes — 2026-10-26+: .../apod/2026-october-
-        # 26-slug/ for the newest entry, .../apod-2026-october-25-slug for
-        # older ones. Matching only the old shape made the bot believe the
-        # feed's newest entry was YESTERDAY and silently skip today.
-        m = re.search(r"/apod(?:/|-)(\d{4})-([a-z]+)-(\d{1,2})(?:-|/|$)", href)
-        if not m:
+        date = _feed_item_date(item, href)
+        if not date:
+            log.warning("APOD feed: undatable entry %s — skipped", href[:90])
             continue
-        month = WEB_MONTHS.get(m.group(2).lower())
-        if not month:
-            continue
-        date = f"{m.group(1)}-{month:02d}-{int(m.group(3)):02d}"
         if (date, href) not in entries:
             entries.append((date, href))
     return entries
@@ -699,21 +750,33 @@ def scrape_apod_web(date: str | None = None) -> dict | None:
     txt = article.text
 
     # --- title + date from og:title ("APOD: 2026 October 1 - <Title>") ---
-    og = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]*)"', txt)
-    og_title = html.unescape(og.group(1)) if og else ""
+    # 2026-10-29: the og:title itself arrived DAY-first ("APOD: 29 October
+    # 2026 - ..."), matching that day's swapped URL slug. Classify the three
+    # date tokens by WHAT they are (4-digit = year, month name = month,
+    # 1-2-digit = day) instead of assuming one fixed order — the same
+    # order-agnostic rule that fixed feed/homepage discovery. The <title>
+    # element is tried with the same logic as a fallback.
+    og = (re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]*)"', txt)
+          or re.search(r"<title>(.*?)</title>", txt, re.S))
+    og_title = html.unescape(og.group(1)).strip() if og else ""
     m = re.search(
-        r"APOD:\s*(\d{4})\s+([A-Za-z]+)\s+(\d{1,2})\s*[-\u2013]\s*(.+?)"
-        r"\s*(?:-\s*NASA Science)?\s*$",
+        r"APOD:\s*(\d{1,4}|[A-Za-z]+)\s+(\d{1,4}|[A-Za-z]+)\s+(\d{1,4}|[A-Za-z]+)"
+        r"\s*[-\u2013]\s*(.+?)\s*(?:-\s*NASA Science)?\s*$",
         og_title,
     )
     if not m:
         log.warning("APOD article: could not parse og:title %r", og_title[:80])
         return None
-    year, month_name, day, title = m.groups()
-    month = WEB_MONTHS.get(month_name.lower())
-    if not month:
+    tok1, tok2, tok3, title = m.groups()
+    toks = [t.lower() for t in (tok1, tok2, tok3)]
+    month = next((WEB_MONTHS[t] for t in toks if t in WEB_MONTHS), None)
+    nums = [t for t in toks if t.isdigit()]
+    year = next((int(t) for t in nums if len(t) == 4), None)
+    day = next((int(t) for t in nums if len(t) <= 2), None)
+    if not (month and year and day and 1 <= day <= 31 and 1995 <= year <= 2100):
+        log.warning("APOD article: undatable og:title %r", og_title[:80])
         return None
-    date = f"{year}-{month:02d}-{int(day):02d}"
+    date = f"{year}-{month:02d}-{day:02d}"
 
     # --- explanation ---
     explanation = ""
